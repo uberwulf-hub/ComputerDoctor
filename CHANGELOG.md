@@ -5,6 +5,8 @@ them as the GitHub release notes, which SauceStore shows as the app's version hi
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-11-11
+
 - Added Computer Doctor to SauceStore
 - Added Recovery > Readiness: BitLocker recovery key, Secure Boot 2023 certificates, Windows RE and Quick Machine Recovery
 - Added the Old files tab to find unused files across your folders
