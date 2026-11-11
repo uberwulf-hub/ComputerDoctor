@@ -214,7 +214,13 @@ and the release file, `ComputerDoctor.ps1`). Add what changed under **Unreleased
 It runs the no-admin checks (`Test-Cli`, `Test-Backup`, `Test-OldFiles`), writes the version into the script, moves
 the changelog lines into the new version, commits and tags `vX.Y.Z`, and makes the GitHub release with
 `ComputerDoctor.ps1` attached (needs `gh`). SauceStore lists it within about 10 minutes and shows the changelog lines as
-the version history. `-WhatIf` runs the checks and copies the script into `build\` only.
+the version history.
+
+The same run then releases **Computer Doctor (Sauce Edition)**, the installed-app version listed under Apps, with the
+same version number: it runs `..\ComputerDoctor-SauceEdition\tools\Release.ps1`, which builds a setup program from this
+release's `ComputerDoctor.ps1` (see [ComputerDoctor-SauceEdition](https://github.com/uberwulf-hub/ComputerDoctor-SauceEdition)).
+Clone that repo next to this one. `-ScriptOnly` releases just the script. `-WhatIf` runs the checks and builds both
+into `build\` folders without releasing anything.
 
 ## Requirements
 
