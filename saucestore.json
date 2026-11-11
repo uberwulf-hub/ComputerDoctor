@@ -1,0 +1,14 @@
+{
+  "name": "Computer Doctor",
+  "category": "Script",
+  "description": "Windows cleanup, health check, debloat, recovery and repair toolkit with a simple window. One PowerShell script; works on this PC or on remote PCs over PowerShell remoting, with or without internet.",
+  "icon": "store/icon.png",
+  "assets": { "windows": "ComputerDoctor.ps1" },
+  "requirements": [
+    "Windows 10 or 11",
+    "Windows PowerShell 5.1 (built into Windows) or PowerShell 7 or later",
+    "Administrator rights for cleaning, debloat and repairs; the checks run without them"
+  ],
+  "rightsConfirmed": true,
+  "credits": []
+}
