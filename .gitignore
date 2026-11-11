@@ -12,3 +12,6 @@ desktop.ini
 # Research notes and reports
 research_notes/
 reports/
+
+# Release builds
+build/

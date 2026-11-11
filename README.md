@@ -202,6 +202,20 @@ Dashboard, per-user Cleaner rules, Old files and Duplicates always stay on this 
 .\tests\Test-UndeleteLive.ps1 -Drive H: -Dest C:\Temp\R   # admin: deletes a test file on H:, recovers it, compares hashes
 ```
 
+## Releasing (SauceStore)
+
+Computer Doctor is listed in SauceStore through `saucestore.json` (name, description, `store\icon.png`, requirements
+and the release file, `ComputerDoctor.ps1`). Add what changed under **Unreleased** in [CHANGELOG.md](CHANGELOG.md), then:
+
+```powershell
+.\tools\Release.ps1 -Version X.Y.Z
+```
+
+It runs the no-admin checks (`Test-Cli`, `Test-Backup`, `Test-OldFiles`), writes the version into the script, moves
+the changelog lines into the new version, commits and tags `vX.Y.Z`, and makes the GitHub release with
+`ComputerDoctor.ps1` attached (needs `gh`). SauceStore lists it within about 10 minutes and shows the changelog lines as
+the version history. `-WhatIf` runs the checks and copies the script into `build\` only.
+
 ## Requirements
 
 - Windows 10 or 11
