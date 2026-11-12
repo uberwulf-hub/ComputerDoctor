@@ -73,11 +73,10 @@ if (-not $ScriptOnly -and -not (Test-Path -LiteralPath $AppRelease)) {
 }
 function Invoke-AppRelease([string[]]$AppArgs) {
     Step 'Releasing Computer Doctor (Sauce Edition)'
-    $ErrorActionPreference = 'Continue'
-    & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $AppRelease -Version $Version @AppArgs 2>&1 | Out-Host
-    $code = $LASTEXITCODE
-    $ErrorActionPreference = 'Stop'
-    return $code
+    # Started in this same window, not piped, so the Android signing step can ask for the key's password.
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$AppRelease`"", '-Version', $Version) + @($AppArgs | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } })
+    $p = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $argList -NoNewWindow -Wait -PassThru
+    return $p.ExitCode
 }
 
 # ---- 2. the checks
