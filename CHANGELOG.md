@@ -5,9 +5,6 @@ them as the GitHub release notes, which SauceStore shows as the app's version hi
 
 ## [Unreleased]
 
-- Added Computer Doctor for Android phones, in the Computer Doctor (Sauce Edition) listing: Health, Space, Apps and Privacy
-- Fixed the app's icon in Start menu search
-
 ## [1.11.0] - 2026-11-11
 
 - Added Computer Doctor to SauceStore

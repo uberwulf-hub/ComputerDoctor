@@ -216,12 +216,12 @@ the changelog lines into the new version, commits and tags `vX.Y.Z`, and makes t
 `ComputerDoctor.ps1` attached (needs `gh`). SauceStore lists it within about 10 minutes and shows the changelog lines as
 the version history.
 
-The same run then releases **Computer Doctor (Sauce Edition)**, listed under Apps, with the same version number: it runs
-`..\ComputerDoctor-SauceEdition\tools\Release.ps1`, which builds a Windows setup program from this release's
-`ComputerDoctor.ps1` and the Android app, and signs the Android app with your key (it may ask for the key's password; see
-[ComputerDoctor-SauceEdition](https://github.com/uberwulf-hub/ComputerDoctor-SauceEdition)).
-Clone that repo next to this one. `-ScriptOnly` releases just the script. `-WhatIf` runs the checks and builds both
-into `build\` folders without releasing anything.
+`-WhatIf` runs the checks and copies the script into `build\` without releasing anything.
+
+**Computer Doctor (Sauce Edition)**, listed under Apps, is Computer Doctor rebuilt as a Windows app (and an Android
+app). It lives in its own repository,
+[ComputerDoctor-SauceEdition](https://github.com/uberwulf-hub/ComputerDoctor-SauceEdition), and is released from there
+(Actions > Release); it doesn't use this script.
 
 ## Requirements
 
