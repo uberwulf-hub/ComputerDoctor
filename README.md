@@ -205,13 +205,15 @@ Dashboard, per-user Cleaner rules, Old files and Duplicates always stay on this 
 ## Releasing (SauceStore)
 
 Computer Doctor is listed in SauceStore through `saucestore.json` (name, description, `store\icon.png`, requirements
-and the release file, `ComputerDoctor.ps1`). Add what changed under **Unreleased** in [CHANGELOG.md](CHANGELOG.md), then:
+and the release file, `ComputerDoctor.ps1`). Add what changed under **Unreleased** in [CHANGELOG.md](CHANGELOG.md), commit and push. Then on GitHub go to **Actions → Release → Run workflow** and type the version (for example `1.12.0`). It runs
+`tools\Release.ps1` on a Windows machine at GitHub, so your PC does nothing, and it can be started from a phone. The same
+script still works from a PC:
 
 ```powershell
 .\tools\Release.ps1 -Version X.Y.Z
 ```
 
-It runs the no-admin checks (`Test-Cli`, `Test-Backup`, `Test-OldFiles`), writes the version into the script, moves
+Either way it runs the no-admin checks (`Test-Cli`, `Test-Backup`, `Test-OldFiles`), writes the version into the script, moves
 the changelog lines into the new version, commits and tags `vX.Y.Z`, and makes the GitHub release with
 `ComputerDoctor.ps1` attached (needs `gh`). SauceStore lists it within about 10 minutes and shows the changelog lines as
 the version history.

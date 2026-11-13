@@ -17,6 +17,7 @@
        within about 10 minutes.
     Computer Doctor (Sauce Edition), the Windows and Android apps under Apps, is released separately from its own
     repository (ComputerDoctor-SauceEdition, Actions > Release).
+    GitHub runs this for releases (.github/workflows/release.yml, Actions > Release); it also works from a PC.
     Never run this unless Andrew asked for the release: a release reaches everyone who installed the app.
 
 .PARAMETER Version
