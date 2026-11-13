@@ -1,0 +1,27 @@
+# Every push to main and every pull request: runs the checks that need no admin rights and no internet, on Windows,
+# with Windows PowerShell 5.1 (the same ones tools/Release.ps1 runs before a release).
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checks
+        shell: powershell
+        run: |
+          $failed = @()
+          foreach ($t in 'Test-Cli.ps1', 'Test-Backup.ps1', 'Test-OldFiles.ps1') {
+            Write-Host "==> $t"
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "tests\$t"
+            if ($LASTEXITCODE -ne 0) { $failed += $t }
+          }
+          if ($failed) { throw "Failed: $($failed -join ', ')" }

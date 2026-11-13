@@ -1,0 +1,39 @@
+# Publishes a Computer Doctor (PowerShell edition) release on GitHub, which SauceStore lists under Scripts. It runs
+# tools/Release.ps1 on a Windows machine at GitHub: the checks, the version written into ComputerDoctor.ps1, CHANGELOG.md's
+# "Unreleased" lines moved under the new version, the "Computer Doctor X.Y.Z" commit and vX.Y.Z tag pushed to main, and
+# the GitHub release with ComputerDoctor.ps1 attached. Your PC does nothing.
+#
+# Start it on GitHub: Actions > Release > Run workflow, and type the version (like 1.12.0). Before that, write what
+# changed under "## [Unreleased]" in CHANGELOG.md, commit and push.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, like 1.12.0 (no v)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency: release
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\Release.ps1 -Version $env:VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'tools\Release.ps1 failed (see above).' }
