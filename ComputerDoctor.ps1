@@ -1715,6 +1715,10 @@ function Add-AWUndoEntry($Capture) {
         Snapshot = @($Capture.Snapshot | ForEach-Object { [pscustomobject]@{ Path = $_.Path; Name = $_.Name; Existed = $_.Existed; Prev = $_.Prev; Kind = $_.Kind } })
         RemoveKeys = @($Capture.RemoveKeys); Revert = [string]$Capture.Revert; Undone = $false
     }
+    # The same undo as Windows tools (Tool + Args in System32), so the Windows app can undo it too; this edition uses Revert.
+    if ($Capture.AppRevert) {
+        $entry | Add-Member -NotePropertyName AppRevert -NotePropertyValue @($Capture.AppRevert | ForEach-Object { [pscustomobject]@{ Tool = [string]$_.Tool; Args = [string]$_.Args } })
+    }
     Save-AWUndoJournal (@(Get-AWUndoJournal) + $entry)
     $id
 }
@@ -2501,20 +2505,24 @@ function Get-WSecurityPosture {
 function Invoke-WSecurityFix([string]$Id) {
     switch ($Id) {
         'Firewall' {
-            $prev = @(Get-NetFirewallProfile | ForEach-Object { "Set-NetFirewallProfile -Name '$($_.Name)' -Enabled $(if ($_.Enabled) { 'True' } else { 'False' })" }) -join '; '
+            $profiles = @(Get-NetFirewallProfile)
+            $prev = @($profiles | ForEach-Object { "Set-NetFirewallProfile -Name '$($_.Name)' -Enabled $(if ($_.Enabled) { 'True' } else { 'False' })" }) -join '; '
+            $app = @($profiles | Where-Object { -not $_.Enabled } | ForEach-Object { [pscustomobject]@{ Tool = 'netsh.exe'; Args = "advfirewall set $("$($_.Name)".ToLowerInvariant())profile state off" } })
             Set-NetFirewallProfile -All -Enabled True -ErrorAction Stop
             Write-WLog 'Windows Firewall turned on for all profiles'
-            [pscustomobject]@{ UndoKind = 'Script'; Label = 'Turned on Windows Firewall'; Revert = $prev }
+            [pscustomobject]@{ UndoKind = 'Script'; Label = 'Turned on Windows Firewall'; Revert = $prev; AppRevert = $app }
         }
         'SMB1' {
             Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction Stop
             Write-WLog 'SMB1 server protocol turned off'
-            [pscustomobject]@{ UndoKind = 'Script'; Label = 'Turned off SMB1'; Revert = 'Set-SmbServerConfiguration -EnableSMB1Protocol $true -Force' }
+            [pscustomobject]@{ UndoKind = 'Script'; Label = 'Turned off SMB1'; Revert = 'Set-SmbServerConfiguration -EnableSMB1Protocol $true -Force'
+                AppRevert = @([pscustomobject]@{ Tool = 'reg.exe'; Args = 'add HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters /v SMB1 /t REG_DWORD /d 1 /f' }) }
         }
         'Guest' {
             Disable-LocalUser -Name 'Guest' -ErrorAction Stop
             Write-WLog 'Guest account disabled'
-            [pscustomobject]@{ UndoKind = 'Script'; Label = 'Disabled the Guest account'; Revert = "Enable-LocalUser -Name 'Guest'" }
+            [pscustomobject]@{ UndoKind = 'Script'; Label = 'Disabled the Guest account'; Revert = "Enable-LocalUser -Name 'Guest'"
+                AppRevert = @([pscustomobject]@{ Tool = 'net.exe'; Args = 'user Guest /active:yes' }) }
         }
         default {
             $vals = switch ($Id) {
@@ -2994,7 +3002,8 @@ function Set-WTimeSource([string]$Peers) {
     Restart-Service w32time -Force
     $r = (& w32tm.exe /resync /force 2>&1) -join ' '
     Write-WLog "Time source set to $Peers - $r"
-    [pscustomobject]@{ UndoKind = 'Script'; Label = "Set time source to $Peers"; Revert = $revert }
+    [pscustomobject]@{ UndoKind = 'Script'; Label = "Set time source to $Peers"; Revert = $revert
+        AppRevert = @([pscustomobject]@{ Tool = 'w32tm.exe'; Args = "/config /manualpeerlist:`"$($p.NtpServer)`" /syncfromflags:$revFlags /update" }) }
 }
 
 # ---------------------------------------------------------------- LAN throughput test (this PC <-> another PC)
@@ -3293,7 +3302,8 @@ function Invoke-WBackup($Job) {
         $plan = & robocopy.exe $src $cur /MIR /L /XJ /R:0 /W:0 /NJH /NJS /FP /NS /NP 2>&1
         $moves = New-Object System.Collections.Generic.List[string]
         foreach ($l in $plan) {
-            if ("$l" -match '^\s*\*EXTRA (File|Dir)\s+(.+?)\s*$') { $moves.Add($Matches[2]) }
+            # A folder line starts with its file count ("*EXTRA Dir  -1  D:\x\"); without stripping it the folder was never kept.
+            if ("$l" -match '^\s*\*EXTRA (File|Dir)\s+(?:-?\d+\s+)?(.+?)\\?\s*$') { $moves.Add($Matches[2]) }
             elseif ("$l" -match '^\s*(Newer|Older|Changed|Tweaked)\s+(.+?)\s*$') { $res.New++; $p = $Matches[2]; if ($p.StartsWith($src, [StringComparison]::OrdinalIgnoreCase)) { $moves.Add((Join-Path $cur $p.Substring($src.TrimEnd('\').Length).TrimStart('\'))) } }
             elseif ("$l" -match '^\s*New File\s') { $res.New++ }
         }
@@ -3822,7 +3832,8 @@ function Get-WHealth {
             try { $rc = $d | Get-StorageReliabilityCounter -ErrorAction Stop } catch { }
             $facts = New-Object System.Collections.Generic.List[string]; $status = 'Good'; $why = @()
             $hs = "$($d.HealthStatus)"
-            if ($hs -and $hs -ne 'Healthy' -and $hs -ne '0') { $status = 'Problem'; $why += "Windows reports the disk as $hs" }
+            # "Unknown" (5) means no health data, often a USB enclosure, not a failing disk: it ends up N/A below.
+            if ($hs -and $hs -notin 'Healthy', '0', 'Unknown', '5') { $status = 'Problem'; $why += "Windows reports the disk as $hs" }
             if ($rc) {
                 if ($rc.Temperature -gt 0) { $facts.Add("$($rc.Temperature) C"); if ($rc.Temperature -ge 70 -and $status -eq 'Good') { $status = 'Warning'; $why += 'running hot' } }
                 if ($rc.Wear -gt 0) {
@@ -3852,7 +3863,7 @@ function Get-WHealth {
                     if ($nv.CriticalTempMinutes -gt 0 -and $status -eq 'Good') { $status = 'Warning'; $why += "ran critically hot for $($nv.CriticalTempMinutes) min" }
                 } catch { }
             }
-            if ($status -eq 'Good' -and $facts.Count -eq 0 -and (-not $hs -or $hs -eq 'Unknown')) {
+            if ($status -eq 'Good' -and $facts.Count -eq 0 -and (-not $hs -or $hs -in 'Unknown', '5')) {
                 $status = 'NA'; $why += $(if ("$($d.BusType)" -eq 'USB') { 'health data is not passed through this USB enclosure' } else { 'the drive does not report health data' })
             }
             $detail = (@($why) + @($facts)) -join ' - '
@@ -10872,7 +10883,8 @@ $ui.SleepNoWake.Add_Click({
     if (-not (Confirm-AW "Stop '$d' from waking the PC$(Get-AWWhere)?`n`nYou can undo this from Rebloat > Undo history.")) { return }
     Start-AWTask -Name 'Disable device wake' -Arguments @{ Dev = [string]$d } -Work {
         Invoke-WTarget { param($n) & powercfg.exe /devicedisablewake $n 2>&1 | Out-Null; Write-WLog "$n can no longer wake the PC"
-            [pscustomobject]@{ UndoKind = 'Script'; Label = "Stopped '$n' waking the PC"; Revert = "& powercfg.exe /deviceenablewake `"$n`" | Out-Null" } } -ArgumentList @($Dev)
+            [pscustomobject]@{ UndoKind = 'Script'; Label = "Stopped '$n' waking the PC"; Revert = "& powercfg.exe /deviceenablewake `"$n`" | Out-Null"
+                AppRevert = @([pscustomobject]@{ Tool = 'powercfg.exe'; Args = "/deviceenablewake `"$n`"" }) } } -ArgumentList @($Dev)
     } -OnComplete {
         param($r)
         foreach ($cap in @($r | Where-Object { $_ -and $_.UndoKind })) { $uid = Add-AWUndoEntry $cap; Write-AWAction 'DisableDeviceWake' @($cap.Label) @{} 'Done' $uid }
