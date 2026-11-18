@@ -9332,7 +9332,7 @@ function Start-AWRebloat {
             if (-not $a.StoreId) { Write-WLog "$($a.Name): no Microsoft Store ID - install it from the Store" 'ERROR'; continue }
             & winget.exe install --id $a.StoreId --source msstore --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | ForEach-Object {
                 $l = ("$_" -replace "`0", '').Trim()
-                if ($l -and $l -notmatch '^[\s\-\\|/]+$' -and $l -notmatch '[▀-▟]') { Write-WLog "winget: $l" }
+                if ($l -and $l -notmatch '^[\s\-\\|/]+$' -and $l -notmatch '[\u2580-\u259F]') { Write-WLog "winget: $l" }
             }
             # -1978335189 = already installed / no applicable upgrade
             if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) { Write-WLog "Reinstalled $($a.Name) from the Microsoft Store"; $ok++ }
