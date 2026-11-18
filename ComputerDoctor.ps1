@@ -5269,12 +5269,13 @@ function Invoke-AWCli {
     # ---- listings
     if ($ListRules) {
         $rows = $script:CleanerRules | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Group = $_.Group; Name = $_.Name; Admin = $_.Admin; Default = $_.Default } }
-        Write-AWCli ($rows | Format-Table -AutoSize | Out-String).TrimEnd()
+        # A fixed wide width, so ids aren't cut short when the output is redirected (a narrow or unknown console).
+        Write-AWCli ($rows | Format-Table -AutoSize | Out-String -Width 400).TrimEnd()
         $result.Steps += [ordered]@{ Step = 'ListRules'; Items = @($rows) }
     }
     if ($ListTweaks) {
         $rows = $script:Tweaks | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Group = $_.Group; Name = $_.Name; Admin = $_.Admin; Default = $_.Default } }
-        Write-AWCli ($rows | Format-Table -AutoSize | Out-String).TrimEnd()
+        Write-AWCli ($rows | Format-Table -AutoSize | Out-String -Width 400).TrimEnd()
         $result.Steps += [ordered]@{ Step = 'ListTweaks'; Items = @($rows) }
     }
 
