@@ -8,6 +8,7 @@ them as the GitHub release notes, which SauceStore shows as the app's version hi
 - Fixed backups not keeping an older version of folders deleted since the last backup
 - Fixed the Health Check marking a disk whose health is "Unknown" (often in a USB enclosure) as a problem; it now shows N/A
 - Fixed: firewall, SMB1, Guest account, time source and wake-device changes can now also be undone from the Computer Doctor app
+
 ## [1.11.0] - 2026-11-11
 
 - Added Computer Doctor to SauceStore
