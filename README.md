@@ -6,12 +6,12 @@ System cleanup, health check, debloat, recovery and repair toolkit for Windows, 
 |--------------|--------------|
 | Dashboard    | Drive usage gauges, system summary, quick actions |
 | Health Check | Checks (disks incl. NVMe health, crashes, hardware errors, stability, devices, battery, antivirus...), Events, Startup time, Security, Privacy, Crashes, Sleep |
-| Cleaner      | Analyze / clean temp files, caches, error reports, crash dumps, update and Delivery Optimization caches, GPU and Steam shader caches (every Steam library), Recycle Bin. Emptying the Recycle Bin (permanent) and deleting blue-screen memory dumps (needed by Crashes) are off by default |
-| Space Map    | SpaceMonger-style nested treemap of any drive or folder (drill down, recycle), with totals by kind (videos, pictures, installers, archives...) and by extension |
+| Cleaner      | Analyze / clean temp files, caches, error reports, crash dumps, update and Delivery Optimization caches, GPU and Steam shader caches (every Steam library), Recycle Bin, Internet and Store app caches, browser service worker caches, VS Code / Slack / Spotify / OneDrive, developer caches (npm, pip, NuGet, Yarn), old Windows and program logs, and other apps' logs, temp files and caches (found by looking, shown per app). Emptying the Recycle Bin (permanent) and deleting blue-screen memory dumps (needed by Crashes) are off by default. Offers to close apps that are open (never forced). **Automatic cleanup** runs the rules you choose on a schedule for your account, without admin rights; when not running as admin, **Report for an administrator** saves a page with the admin-only cleanups and short steps |
+| Space Map    | SpaceMonger-style nested treemap of any drive or folder (drill down, recycle), with totals by kind (videos, pictures, installers, archives...) and by extension. **Highlight what you can clean**: green for junk a cleaner rule removes and old installers in Downloads, red for folders your account can't delete, plus a count of folders the scan couldn't read |
 | Large Files  | **Largest** — the 1,000 largest files from the last scan. **Old files** — files in your Downloads, Desktop, Documents, Pictures, Videos, Music or any folder you add, not modified or opened for 30 days to 2 years, filtered by size and kind; only obvious leftovers (installers and disk images in Downloads, archives already extracted) are pre-ticked, and OneDrive files are labelled. **Duplicates** — exact copies (size, then a hash of the first 64 KB, then full SHA-256) or similar photos (perceptual hash). Searchable, recycle or export |
 | Recovery     | Recycle Bin restore, previous versions, native NTFS undelete, restore points, versioned folder backup, deep scan with Windows File Recovery. **Readiness**: BitLocker recovery key, Secure Boot 2023 certificates, Windows RE / Quick Machine Recovery, restore points and backup |
 | Startup      | Enable / disable startup entries (same `StartupApproved` switches Task Manager uses). **Right-click menu** tab: turn off menu entries programs added (shell extensions and commands), with undo |
-| Programs     | Installed software list with size, search and uninstall |
+| Programs     | Installed software list with size, search and uninstall; filter by who it's installed for (Just me / All users) — programs installed just for you uninstall without admin rights |
 | Drivers      | Installed drivers with vendor, age and problems; updates from Windows Update; vendor and PC-maker download pages; driver backup / restore. **Windows updates** tab: missing-update scan online or offline, install from Resources |
 | IT Admin     | User profiles, printers, helpdesk actions, software push, security baseline audit, time sync and LAN speed test |
 | BIOS         | Firmware version, boot mode, Secure Boot, TPM, virtualization, boot order, and full BIOS setup options on Dell / HP / Lenovo business PCs - view only |
@@ -137,6 +137,7 @@ Any of these parameters runs Computer Doctor without a window — from a script,
 .\ComputerDoctor.ps1 -CheckDrivers                                  # driver problems, Windows Update driver offers, maker page
 .\ComputerDoctor.ps1 -Inventory PC01,PC02,localhost                 # fleet inventory report + changes since last run
 .\ComputerDoctor.ps1 -Backup -Yes                                   # run the backup set up in the window
+.\ComputerDoctor.ps1 -AutoClean                                     # run the automatic cleanup set up in Cleaner (no -Yes needed)
 .\ComputerDoctor.ps1 -ExportNeeds                                   # offline PC: save what it's missing to Resources\needs
 .\ComputerDoctor.ps1 -Fetch -Yes                                    # connected PC: download it all into Resources
 .\ComputerDoctor.ps1 -Config p.json -Yes -OutFile \\srv\drop\{computer}-{date}.json   # tokens expand per run
@@ -149,6 +150,8 @@ A profile is plain JSON and may only reference built-in IDs:
 { "RestorePoint": "Monthly maintenance", "Clean": ["Default"], "ApplyTweaks": ["AdId", "Suggestions"],
   "RemoveApps": ["Recommended"], "HealthCheck": true }
 ```
+
+`-AutoClean` is what the **ComputerDoctor Auto Clean** scheduled task runs (from a copy at `%LOCALAPPDATA%\ComputerDoctor\AutoClean`, as you, without admin rights): it cleans only the rules ticked in Cleaner > Automatic cleanup (never ones that need admin), skips apps that are open and then offers, in a small popup, to close them and finish. Turning automatic cleanup off removes the task.
 
 Exit codes: `0` OK · `1` a step failed · `2` bad arguments · `3` health warnings · `4` health problems · `5` PowerShell is in ConstrainedLanguage mode. Headless runs never show a UAC prompt; run them from an elevated prompt (or as SYSTEM in a scheduled task) for admin-only items.
 
@@ -198,6 +201,7 @@ Dashboard, per-user Cleaner rules, Old files and Duplicates always stay on this 
 .\tests\Test-AirGap.ps1                                   # internet: needs list -> catalog driver + baselines -> manifest
 .\tests\Test-Backup.ps1                                   # no admin: backup versions, mirror and drive guard
 .\tests\Test-OldFiles.ps1                                 # no admin: old-files age / size limits, skipped folders, extracted archives
+.\tests\Test-Cleaner.ps1                                  # no admin: apps' logs and caches found by looking, Space Map matching, admin report
 .\tests\Test-UndeleteSynthetic.ps1                        # no admin: builds a tiny NTFS image and checks the undelete engine
 .\tests\Test-UndeleteLive.ps1 -Drive H: -Dest C:\Temp\R   # admin: deletes a test file on H:, recovers it, compares hashes
 ```
@@ -213,7 +217,7 @@ script still works from a PC:
 .\tools\Release.ps1 -Version X.Y.Z
 ```
 
-Either way it runs the no-admin checks (`Test-Cli`, `Test-Backup`, `Test-OldFiles`), writes the version into the script, moves
+Either way it runs the no-admin checks (`Test-Cli`, `Test-Backup`, `Test-OldFiles`, `Test-Cleaner`), writes the version into the script, moves
 the changelog lines into the new version, commits and tags `vX.Y.Z`, and makes the GitHub release with
 `ComputerDoctor.ps1` attached (needs `gh`). SauceStore lists it within about 10 minutes and shows the changelog lines as
 the version history.

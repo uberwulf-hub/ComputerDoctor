@@ -19,7 +19,7 @@ jobs:
         shell: powershell
         run: |
           $failed = @()
-          foreach ($t in 'Test-Cli.ps1', 'Test-Backup.ps1', 'Test-OldFiles.ps1') {
+          foreach ($t in 'Test-Cli.ps1', 'Test-Backup.ps1', 'Test-OldFiles.ps1', 'Test-Cleaner.ps1') {
             Write-Host "==> $t"
             & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "tests\$t"
             if ($LASTEXITCODE -ne 0) { $failed += $t }

@@ -164,6 +164,7 @@ param(
     [switch]$ListApps,
     [switch]$CheckDrivers,           # list driver problems and updates Windows Update offers
     [switch]$Backup,                 # run the folder backup set up in the window (used by the schedule)
+    [switch]$AutoClean,              # run the automatic cleanup set up in Cleaner (used by its schedule; no admin, no prompts)
     [string[]]$Inventory,            # fleet inventory of these PCs (names / addresses, 'localhost' for this one)
     [switch]$ExportNeeds,            # offline PC: write what it is missing to <Resources>\needs\<PC>.json
     [switch]$Fetch,                  # connected PC: download everything the needs lists in <Resources> ask for
@@ -180,7 +181,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $script:AppVersion = '1.11.1'
 $script:CliMode = [bool]($Config -or $Analyze -or $Clean -or $HealthCheck -or $ApplyTweak -or $RevertTweak -or $RemoveApp -or
-                         $RestorePoint -or $ListRules -or $ListTweaks -or $ListApps -or $CheckDrivers -or $Backup -or $Inventory -or $ExportNeeds -or $Fetch)
+                         $RestorePoint -or $ListRules -or $ListTweaks -or $ListApps -or $CheckDrivers -or $Backup -or $AutoClean -or $Inventory -or $ExportNeeds -or $Fetch)
 
 # Under App Control / AppLocker, unsigned scripts run in ConstrainedLanguage mode, which blocks WPF,
 # embedded C# and most .NET/COM use. Explain instead of failing with a wall of red text.
@@ -287,6 +288,8 @@ namespace ComputerDoctor
         public long FileCount { get; set; }
         public bool IsDir { get; set; }
         public bool IsGroup { get; set; }
+        public DateTime Modified { get; set; }      // files only
+        public bool Denied { get; set; }            // folder the scan couldn't read
         public DiskNode Parent { get; set; }
         public List<DiskNode> Children { get; set; }
         public string SizeText { get { return Fmt.Size(Size); } }
@@ -427,6 +430,7 @@ namespace ComputerDoctor
         public long FoldersScanned;
         public long BytesScanned;
         public long Errors;
+        public long DeniedFolders;
         public volatile bool Cancel;
         public volatile string CurrentPath = "";
         public long SmallFileThreshold = 1048576;
@@ -496,6 +500,7 @@ namespace ComputerDoctor
             FoldersScanned++;
             FileSystemInfo[] entries;
             try { entries = di.GetFileSystemInfos(); }
+            catch (UnauthorizedAccessException) { Errors++; DeniedFolders++; node.Denied = true; return; }
             catch { Errors++; return; }
 
             long smallSize = 0; long smallCount = 0;
@@ -535,6 +540,7 @@ namespace ComputerDoctor
                 {
                     var fn = new DiskNode();
                     fn.Name = f.Name; fn.FullPath = f.FullName; fn.Size = len; fn.FileCount = 1; fn.Parent = node;
+                    try { fn.Modified = f.LastWriteTime; } catch { }
                     node.Children.Add(fn);
                 }
                 else { smallSize += len; smallCount++; }
@@ -616,6 +622,175 @@ namespace ComputerDoctor
             long max = s.ExtensionList.Count > 0 ? s.ExtensionList[0].Size : 0;
             foreach (var e in s.ExtensionList) { e.Percent = s.Root != null && s.Root.Size > 0 ? e.Size * 100.0 / s.Root.Size : 0; e.RelPercent = max > 0 ? e.Size * 100.0 / max : 0; }
             return s;
+        }
+    }
+
+    // Can the signed-in account delete or list a folder? Read from the folder's (and its parent's) access
+    // rules against the user's SID and group SIDs. Results are cached per path; Get() never blocks the
+    // caller: unknown paths are queued and checked on a background thread (Version goes up when done).
+    public static class FolderRights
+    {
+        public const int Unknown = 0, Ok = 1, CantDelete = 2, CantList = 3;
+        private static readonly Dictionary<string, int> cache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Queue<string> queue = new Queue<string>();
+        private static readonly Dictionary<string, bool> queued = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);   // no HashSet: System.Core isn't referenced
+        private static readonly object gate = new object();
+        private static bool running;
+        private static List<System.Security.Principal.SecurityIdentifier> sids;
+        public static volatile int Version;
+        public static int Pending { get { lock (gate) { return queue.Count + (running ? 1 : 0); } } }
+
+        public static void Clear() { lock (gate) { cache.Clear(); queue.Clear(); queued.Clear(); } }
+
+        public static int Get(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return Unknown;
+            lock (gate)
+            {
+                int v;
+                if (cache.TryGetValue(path, out v)) return v;
+                if (!queued.ContainsKey(path)) { queued[path] = true; queue.Enqueue(path); }
+                if (!running)
+                {
+                    running = true;
+                    System.Threading.ThreadPool.QueueUserWorkItem(Work);
+                }
+            }
+            return Unknown;
+        }
+
+        private static void Work(object state)
+        {
+            while (true)
+            {
+                string p;
+                lock (gate)
+                {
+                    if (queue.Count == 0) { running = false; Version++; return; }
+                    p = queue.Dequeue();
+                }
+                int v;
+                try { v = Check(p); } catch { v = Ok; }
+                lock (gate) { cache[p] = v; queued.Remove(p); }
+            }
+        }
+
+        private static List<System.Security.Principal.SecurityIdentifier> Sids()
+        {
+            if (sids != null) return sids;
+            var list = new List<System.Security.Principal.SecurityIdentifier>();
+            var id = System.Security.Principal.WindowsIdentity.GetCurrent();
+            if (id.User != null) list.Add(id.User);
+            if (id.Groups != null)
+                foreach (var g in id.Groups)
+                {
+                    var sid = g as System.Security.Principal.SecurityIdentifier;
+                    if (sid == null) { try { sid = (System.Security.Principal.SecurityIdentifier)g.Translate(typeof(System.Security.Principal.SecurityIdentifier)); } catch { } }
+                    if (sid != null) list.Add(sid);
+                }
+            sids = list;
+            return sids;
+        }
+
+        // Effective rights from the folder's own (non-inherit-only) access rules; -1 when they can't be read.
+        public static int Rights(string path)
+        {
+            System.Security.AccessControl.DirectorySecurity sec;
+            try { sec = new DirectoryInfo(path).GetAccessControl(System.Security.AccessControl.AccessControlSections.Access); }
+            catch { return -1; }
+            var mine = Sids();
+            int allow = 0, deny = 0;
+            foreach (System.Security.AccessControl.FileSystemAccessRule r in sec.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier)))
+            {
+                if ((r.PropagationFlags & System.Security.AccessControl.PropagationFlags.InheritOnly) != 0) continue;
+                var sid = r.IdentityReference as System.Security.Principal.SecurityIdentifier;
+                if (sid == null || !mine.Contains(sid)) continue;
+                int m = (int)r.FileSystemRights;
+                if ((m & 0x10000000) != 0) m |= 0x1F01FF;                 // GENERIC_ALL
+                if ((m & 0x40000000) != 0) m |= 0x116;                    // GENERIC_WRITE
+                if ((m & unchecked((int)0x80000000)) != 0) m |= 0x89;     // GENERIC_READ
+                if (r.AccessControlType == System.Security.AccessControl.AccessControlType.Deny) deny |= m; else allow |= m;
+            }
+            return allow & ~deny;
+        }
+
+        public static int Check(string path)
+        {
+            const int ListDirectory = 0x1, DeleteChild = 0x40, Delete = 0x10000;
+            int own = Rights(path);
+            if (own == -1)
+            {
+                // The rules themselves can't be read: try listing the folder.
+                try { using (var e = Directory.EnumerateFileSystemEntries(path).GetEnumerator()) { e.MoveNext(); } }
+                catch (UnauthorizedAccessException) { return CantList; }
+                catch { return Ok; }
+                own = 0;
+            }
+            else if ((own & ListDirectory) == 0) return CantList;
+            if ((own & Delete) != 0) return Ok;
+            string parent = null;
+            try { var pi = Directory.GetParent(path); if (pi != null) parent = pi.FullName; } catch { }
+            if (parent == null) return CantDelete;                        // a drive root can't be deleted
+            int up = Rights(parent);
+            if (up != -1 && (up & DeleteChild) != 0) return Ok;
+            return CantDelete;
+        }
+    }
+
+    // Folders and files a cleaner rule would remove, for the Space Map. Add() each rule target
+    // (already expanded); Match() walks up from a path and returns the reason, or null.
+    public static class CleanMap
+    {
+        private class Entry { public string Filter; public bool Recurse; public string Reason; }
+        private static Dictionary<string, List<Entry>> map = new Dictionary<string, List<Entry>>(StringComparer.OrdinalIgnoreCase);
+        public static int Count { get { return map.Count; } }
+
+        public static void Clear() { map = new Dictionary<string, List<Entry>>(StringComparer.OrdinalIgnoreCase); }
+
+        public static void Add(string path, string filter, bool recurse, string reason)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            path = path.TrimEnd('\\');
+            List<Entry> l;
+            if (!map.TryGetValue(path, out l)) { l = new List<Entry>(); map[path] = l; }
+            var e = new Entry(); e.Filter = string.IsNullOrEmpty(filter) ? "*" : filter; e.Recurse = recurse; e.Reason = reason;
+            l.Add(e);
+        }
+
+        private static bool Like(string name, string pattern)
+        {
+            if (pattern == "*") return true;
+            var rx = "^" + System.Text.RegularExpressions.Regex.Escape(pattern).Replace("\\*", ".*").Replace("\\?", ".") + "$";
+            return System.Text.RegularExpressions.Regex.IsMatch(name, rx, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        }
+
+        // isDir: a folder (or a group of small files, matched as its folder).
+        public static string Match(string path, bool isDir)
+        {
+            if (string.IsNullOrEmpty(path) || map.Count == 0) return null;
+            string p = path.TrimEnd('\\');
+            string name = p.Substring(p.LastIndexOf('\\') + 1);
+            int level = 0;                                                  // 0 = the item itself, 1 = its folder, ...
+            while (!string.IsNullOrEmpty(p))
+            {
+                List<Entry> l;
+                if (map.TryGetValue(p, out l))
+                {
+                    foreach (var e in l)
+                    {
+                        if (level == 0) { if (isDir && e.Filter == "*" && e.Recurse) return e.Reason; continue; }
+                        if (!e.Recurse && level > 1) continue;
+                        if (e.Filter == "*") { if (e.Recurse || !isDir) return e.Reason; continue; }
+                        if (!isDir && level == 1 && Like(name, e.Filter)) return e.Reason;
+                        if (!isDir && e.Recurse && Like(name, e.Filter)) return e.Reason;
+                    }
+                }
+                int i = p.LastIndexOf('\\');
+                if (i <= 0) break;
+                p = p.Substring(0, i);
+                level++;
+            }
+            return null;
         }
     }
 
@@ -1572,6 +1747,40 @@ namespace ComputerDoctor
             return name.ToString().ToUpperInvariant();
         }
 
+        // Asks the given processes to close the way clicking X does: WM_CLOSE to each of their visible top-level
+        // windows. Nothing is force-closed; an app can still ask about unsaved work. Returns the windows asked.
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+        [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+        [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hWnd, uint cmd);
+        [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+        [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+        public static int CloseWindows(int[] pids)
+        {
+            var want = new Dictionary<uint, bool>();
+            foreach (var p in pids) want[(uint)p] = true;
+            var found = new List<IntPtr>();
+            EnumWindows(delegate (IntPtr h, IntPtr l)
+            {
+                uint pid;
+                GetWindowThreadProcessId(h, out pid);
+                if (want.ContainsKey(pid) && IsWindowVisible(h) && GetWindow(h, 4 /* GW_OWNER */) == IntPtr.Zero) found.Add(h);
+                return true;
+            }, IntPtr.Zero);
+            foreach (var h in found) PostMessage(h, 0x0010 /* WM_CLOSE */, IntPtr.Zero, IntPtr.Zero);
+            return found.Count;
+        }
+
+        // Long form of a path that may hold 8.3 short names (%TEMP% often does), or the path itself.
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] private static extern uint GetLongPathName(string shortPath, System.Text.StringBuilder longPath, uint size);
+        public static string LongPath(string path)
+        {
+            if (string.IsNullOrEmpty(path) || path.IndexOf('~') < 0) return path;
+            var sb = new System.Text.StringBuilder(1024);
+            uint n = GetLongPathName(path, sb, 1024);
+            return (n > 0 && n < 1024) ? sb.ToString() : path;
+        }
+
         public static bool OwnsConsole()
         {
             try { var l = new uint[8]; return GetConsoleProcessList(l, 8) <= 1; } catch { return false; }
@@ -1622,8 +1831,25 @@ $script:LogFile   = Join-Path $script:DataDir 'ComputerDoctor.log'
 $script:StateFile = Join-Path $script:DataDir 'state.json'
 if (-not (Test-Path -LiteralPath $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
 
+function Read-AWAutoCleanState($j) {
+    $a = $j.AutoClean
+    if (-not $a) { return }
+    $ac = $script:State.AutoClean
+    $ac.Enabled = [bool]$a.Enabled
+    $ac.Rules = @($a.Rules | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    if ($a.Day -in 'Daily', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday') { $ac.Day = [string]$a.Day }
+    if ([string]$a.Time -match '^([01]?\d|2[0-3]):[0-5]\d$') { $ac.Time = [string]$a.Time }
+    $ac.LastRun = if ($a.LastRun -is [datetime]) { $a.LastRun.ToString('o') } elseif ($a.LastRun) { [string]$a.LastRun } else { $null }
+    $ac.LastFreed = [long]$a.LastFreed
+    $ac.LastResult = [string]$a.LastResult
+}
+
 $script:State = @{ TotalFreed = [long]0; Cleans = 0; LastClean = ''; RecentTargets = @(); AutoRestorePoint = $true; ResourcesPath = ''; ForceOffline = $false
-                   FleetHosts = ''; OldFolders = @('Downloads'); Backup = @{ Sources = @(); Dest = ''; DestVolumeId = ''; Keep = 10; Daily = $false; Time = '19:00'; LastRun = ''; LastResult = '' } }
+                   FleetHosts = ''; OldFolders = @('Downloads'); Backup = @{ Sources = @(); Dest = ''; DestVolumeId = ''; Keep = 10; Daily = $false; Time = '19:00'; LastRun = ''; LastResult = '' }
+                   AutoClean = [ordered]@{ Enabled = $false; Rules = @(); Day = 'Sunday'; Time = '12:00'; LastRun = $null; LastFreed = [long]0; LastResult = '' }
+                   MapHighlight = $true; ProgramsScope = 'All' }
+# Keys this edition doesn't know (the Windows app shares state.json) are kept as they are.
+$script:StateExtra = [ordered]@{}
 try {
     if (Test-Path -LiteralPath $script:StateFile) {
         $j = Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json
@@ -1642,11 +1868,23 @@ try {
             if ($j.Backup.Keep) { $script:State.Backup.Keep = [int]$j.Backup.Keep }
             $script:State.Backup.Daily = [bool]$j.Backup.Daily
         }
+        Read-AWAutoCleanState $j
+        if ($null -ne $j.MapHighlight) { $script:State.MapHighlight = [bool]$j.MapHighlight }
+        if ($j.ProgramsScope -in 'All', 'Just me', 'All users') { $script:State.ProgramsScope = [string]$j.ProgramsScope }
+        foreach ($pr in $j.PSObject.Properties) { if (-not $script:State.ContainsKey($pr.Name)) { $script:StateExtra[$pr.Name] = $pr.Value } }
     }
 } catch { }
 
 function Save-AWState {
-    try { $script:State | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:StateFile -Encoding UTF8 } catch { }
+    $out = [ordered]@{}
+    foreach ($k in $script:StateExtra.Keys) { $out[$k] = $script:StateExtra[$k] }
+    foreach ($k in $script:State.Keys) { $out[$k] = $script:State[$k] }
+    try { ConvertTo-Json -InputObject $out -Depth 8 | Set-Content -LiteralPath $script:StateFile -Encoding UTF8 } catch { }
+}
+
+# Re-reads only AutoClean from state.json (the scheduled run, or the other edition, may have written it since).
+function Update-AWAutoCleanFromDisk {
+    try { if (Test-Path -LiteralPath $script:StateFile) { Read-AWAutoCleanState (Get-Content -LiteralPath $script:StateFile -Raw | ConvertFrom-Json) } } catch { }
 }
 
 $Sync = [hashtable]::Synchronized(@{})
@@ -4066,6 +4304,248 @@ function Get-WRecycleFolders {
     }
 }
 
+function Get-WSubDirs([string]$Path) {
+    try {
+        foreach ($d in ([IO.DirectoryInfo]$Path).EnumerateDirectories()) {
+            if (-not ($d.Attributes -band [IO.FileAttributes]::ReparsePoint)) { $d }     # never follow junctions / links
+        }
+    } catch { }
+}
+
+# Programs' own log / temp / crash-report folders (Take = 'Log') or cache folders (Take = 'Cache'), found by
+# looking under $Item.Discover.Bases up to MaxDepth folder levels. Returns one entry per program (its top folder
+# name): @{ App; Tops = top folders; Targets = @{ Path; Recurse; Names; MinAgeHours } }. Folders that other rules
+# cover ($Item.Covered), NeverInside folders, junctions and data folders (IndexedDB, Local Storage, ...) are skipped.
+function Find-WAppFolders($Item) {
+    $cfg = $Item.Discover
+    $ci = [StringComparer]::OrdinalIgnoreCase
+    $exp = { param($p) [Environment]::ExpandEnvironmentVariables([string]$p).TrimEnd('\') }
+    $long = { param($p) if ($p -and $p.Contains('~') -and ('ComputerDoctor.Native' -as [type])) { [ComputerDoctor.Native]::LongPath($p) } else { $p } }
+    $stop = New-Object 'System.Collections.Generic.HashSet[string]' $ci       # never enter or take
+    $hold = New-Object 'System.Collections.Generic.HashSet[string]' $ci       # holds a stop folder: walk in, never take whole
+    $add = {
+        param($p)
+        if (-not $p) { return }
+        $p = & $long $p
+        [void]$stop.Add($p)
+        $i = $p.LastIndexOf('\')
+        while ($i -gt 2) { $p = $p.Substring(0, $i); [void]$hold.Add($p); $i = $p.LastIndexOf('\') }
+    }
+    foreach ($n in @($cfg.NeverInside)) { & $add (& $exp $n) }
+    foreach ($x in @($cfg.Extra)) { if ($x) { & $add (& $exp $x.Path) } }
+    foreach ($c in @($Item.Covered)) { foreach ($root in (Resolve-WTarget $c)) { & $add $root.TrimEnd('\') } }
+
+    $cacheNames = New-Object 'System.Collections.Generic.HashSet[string]' $ci
+    foreach ($n in 'Cache', 'Caches', 'cache2', 'Code Cache', 'GPUCache', 'DawnCache', 'DawnGraphiteCache', 'DawnWebGPUCache', 'GrShaderCache', 'ShaderCache', 'CachedData') { [void]$cacheNames.Add($n) }
+    $cachePairs = New-Object 'System.Collections.Generic.HashSet[string]' $ci
+    foreach ($n in 'Service Worker\CacheStorage', 'Service Worker\ScriptCache') { [void]$cachePairs.Add($n) }
+    $logNames = New-Object 'System.Collections.Generic.HashSet[string]' $ci
+    $ln = if ($cfg.LogNames) { $cfg.LogNames } else { @('Logs', 'Log', 'Temp', 'tmp', 'Crash Reports', 'CrashDumps', 'CrashReports') }
+    foreach ($n in $ln) { [void]$logNames.Add($n) }
+    $logPairs = New-Object 'System.Collections.Generic.HashSet[string]' $ci
+    if (-not $cfg.LogNames) { [void]$logPairs.Add('Crashpad\reports') }
+    $skip = New-Object 'System.Collections.Generic.HashSet[string]' $ci
+    foreach ($n in 'IndexedDB', 'Local Storage', 'Session Storage', 'databases', 'blob_storage', 'File System', 'Extensions', 'Backups', 'Saves', 'Saved Games',
+                   'OneDrive', 'Dropbox', 'DriveFS', 'Google Drive', 'Box', 'Box Sync', 'iCloud', 'iCloudDrive', 'MEGAsync', 'Nextcloud', 'ownCloud', 'pCloud') { [void]$skip.Add($n) }
+
+    $apps = [ordered]@{}
+    $getSet = {
+        param($name, $top)
+        $k = $name.ToLowerInvariant()
+        if (-not $apps.Contains($k)) { $apps[$k] = @{ App = $name; Tops = New-Object System.Collections.Generic.List[string]; Targets = New-Object System.Collections.Generic.List[object] } }
+        $apps[$k].Tops.Add($top)
+        $apps[$k]
+    }
+    foreach ($b in @($cfg.Bases)) {
+        $bp = & $long (& $exp $b)
+        if (-not $bp -or -not [IO.Directory]::Exists($bp)) { continue }
+        foreach ($top in @(Get-WSubDirs $bp)) {
+            if ($stop.Contains($top.FullName) -or $skip.Contains($top.Name)) { continue }
+            $set = & $getSet $top.Name $top.FullName
+            if (@($cfg.TopFiles).Count) { $set.Targets.Add(@{ Path = $top.FullName; Recurse = $false; Names = @($cfg.TopFiles); MinAgeHours = $cfg.MinAgeHours }) }
+            $stack = New-Object System.Collections.Generic.Stack[object]
+            $stack.Push(@($top, 1, ''))
+            while ($stack.Count) {
+                $e = $stack.Pop(); $dir = $e[0]; $lvl = $e[1]; $mode = $e[2]
+                foreach ($d in @(Get-WSubDirs $dir.FullName)) {
+                    $n = $d.Name
+                    if ($skip.Contains($n) -or $stop.Contains($d.FullName)) { continue }
+                    $pair = $dir.Name + '\' + $n
+                    $kind = ''
+                    if ($mode -eq 'Profiles') { if ($n -eq 'cache2') { $kind = 'Cache' } }
+                    elseif ($cacheNames.Contains($n) -or $cachePairs.Contains($pair)) { $kind = 'Cache' }
+                    elseif ($mode -ne 'UserData' -and ($logNames.Contains($n) -or $logPairs.Contains($pair))) { $kind = 'Log' }
+                    if ($kind) {
+                        if ($kind -eq $cfg.Take -and -not $hold.Contains($d.FullName)) { $set.Targets.Add(@{ Path = $d.FullName; Recurse = $true; Names = $null; MinAgeHours = $cfg.MinAgeHours }) }
+                        continue                                            # a matched folder is taken whole, never split
+                    }
+                    if ($lvl + 1 -lt $cfg.MaxDepth) {
+                        $m = if ($n -eq 'Profiles') { 'Profiles' } elseif ($n -eq 'User Data') { 'UserData' } else { $mode }
+                        $stack.Push(@($d, ($lvl + 1), $m))
+                    }
+                }
+            }
+        }
+    }
+    if ($cfg.Take -eq 'Log') {
+        foreach ($x in @($cfg.Extra)) {
+            if (-not $x) { continue }
+            $p = & $long (& $exp $x.Path)
+            if ([IO.Directory]::Exists($p)) { $set = & $getSet $x.App $p; $set.Targets.Add(@{ Path = $p; Recurse = $true; Names = $null; MinAgeHours = $x.MinAgeHours }) }
+        }
+    }
+    foreach ($s in $apps.Values) { if ($s.Targets.Count) { $s } }
+}
+
+# Files of one found target: no junctions, only names matching Names (when set), older than MinAgeHours.
+function Get-WFoundFiles($T) {
+    $cutoff = if ($T.MinAgeHours -gt 0) { (Get-Date).AddHours(-[double]$T.MinAgeHours) } else { $null }
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($T.Path)
+    while ($stack.Count) {
+        $entries = try { @(([IO.DirectoryInfo]$stack.Pop()).GetFileSystemInfos()) } catch { @() }
+        foreach ($e in $entries) {
+            if ($e -is [IO.DirectoryInfo]) {
+                if ($T.Recurse -and -not ($e.Attributes -band [IO.FileAttributes]::ReparsePoint)) { $stack.Push($e.FullName) }
+                continue
+            }
+            if ($T.Names) { $ok = $false; foreach ($n in $T.Names) { if ($e.Name -like $n) { $ok = $true; break } }; if (-not $ok) { continue } }
+            if ($cutoff -and $e.LastWriteTime -gt $cutoff) { continue }
+            $e
+        }
+    }
+}
+
+function Get-WProcPaths {
+    @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $p = $null; try { $p = $_.Path } catch { }; @{ Name = $_.ProcessName; Path = [string]$p } })
+}
+# Best effort: a process named like the program's top folder, or running from inside it.
+function Test-WAppRunning($Set, $Procs) {
+    foreach ($pr in $Procs) {
+        if ($pr.Name -ieq $Set.App) { return $true }
+        if ($pr.Path) { foreach ($t in $Set.Tops) { if ($pr.Path.StartsWith($t + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true } } }
+    }
+    $false
+}
+
+function Format-WAppCount([int]$N) { if ($N -eq 1) { '1 app' } else { "$N apps" } }
+
+# What the Space Map shows as cleanable: every target of the rules that don't need admin, expanded on this PC.
+function Get-WCleanMapEntries($Rules) {
+    foreach ($rule in @($Rules)) {
+        if ($rule.Admin) { continue }
+        switch ($rule.Kind) {
+            'Files' {
+                foreach ($t in $rule.Targets) {
+                    foreach ($root in (Resolve-WTarget $t.Path)) { @{ Path = $(if ($root.Contains('~')) { [ComputerDoctor.Native]::LongPath($root) } else { $root }); Filter = $(if ($t.Filter) { $t.Filter } else { '*' }); Recurse = ($t.Recurse -ne $false); Reason = $rule.Name } }
+                }
+            }
+            'RecycleBin' { foreach ($rb in (Get-WRecycleFolders)) { @{ Path = $rb; Filter = '*'; Recurse = $true; Reason = $rule.Name } } }
+            'Found' {
+                foreach ($set in (Find-WAppFolders $rule)) {
+                    foreach ($t in $set.Targets) {
+                        if ($t.Names) { foreach ($n in $t.Names) { @{ Path = $t.Path; Filter = $n; Recurse = $false; Reason = $rule.Name } } }
+                        else { @{ Path = $t.Path; Filter = '*'; Recurse = $true; Reason = $rule.Name } }
+                    }
+                }
+            }
+        }
+    }
+}
+
+# ---- Apps that must be closed before cleaning. A blocker is @{ Label; Names (process names); Tops (folders) }.
+function Get-WAppLabel([string]$Name, [string]$Fallback) {
+    $l = @{ msedge = 'Edge'; chrome = 'Chrome'; brave = 'Brave'; firefox = 'Firefox'; teams = 'Teams'; 'ms-teams' = 'Teams' }[$Name.ToLowerInvariant()]
+    if ($l) { $l } elseif ($Fallback) { $Fallback } else { $Name }
+}
+function Get-WBlockerProcs($Blocker) {
+    @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $pr = $_
+        if (@($Blocker.Names | Where-Object { $_ -and $pr.ProcessName -ieq $_ }).Count) { return $true }
+        $path = $null; try { $path = $pr.Path } catch { }
+        $path -and @($Blocker.Tops | Where-Object { $_ -and $path.StartsWith($_ + '\', [StringComparison]::OrdinalIgnoreCase) }).Count
+    })
+}
+# The open apps that hold back a rule: one blocker per running app (a browser rule can name several).
+function Get-WRuleBlockers($Item) {
+    if ($Item.Kind -eq 'Found') {
+        $procs = Get-WProcPaths
+        foreach ($set in (Find-WAppFolders $Item)) {
+            if (Test-WAppRunning $set $procs) { @{ Label = $set.App; Names = @($set.App); Tops = @($set.Tops); RuleId = $Item.Id; RuleName = $Item.Name; Set = $set } }
+        }
+        return
+    }
+    foreach ($n in @($Item.Process)) {
+        if ($n -and (Get-Process -Name $n -ErrorAction SilentlyContinue)) {
+            @{ Label = (Get-WAppLabel $n $Item.ProcessLabel); Names = @($n); Tops = @(); RuleId = $Item.Id; RuleName = $Item.Name }
+        }
+    }
+}
+# Asks the apps to close the way clicking X does (WM_CLOSE to each of their windows). Never force-kills.
+function Close-WBlockers($Blockers) {
+    $ids = @(foreach ($b in @($Blockers)) { Get-WBlockerProcs $b | ForEach-Object { $_.Id } })
+    if ($ids.Count) { [void][ComputerDoctor.Native]::CloseWindows([int[]]$ids) }
+    $ids.Count
+}
+# Labels of the blockers that still have a process running.
+function Get-WOpenBlockers($Blockers) {
+    @(foreach ($b in @($Blockers)) { if (@(Get-WBlockerProcs $b).Count) { $b.Label } }) | Select-Object -Unique
+}
+function Wait-WBlockersClosed($Blockers, [int]$Seconds = 15) {
+    $until = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $until -and @(Get-WOpenBlockers $Blockers).Count) { Start-Sleep -Milliseconds 500 }
+    @(Get-WOpenBlockers $Blockers)
+}
+
+# Report of the cleanups that need administrator rights, to hand to someone who has them. $Info: Computer, Windows,
+# User, Drive, Date. $Items: Id, Name, Desc, Bytes (-1 = can't be measured without admin). Returns @{ Text; Html }.
+function New-WAdminReport($Info, $Items, [string]$ScriptPath) {
+    $Items = @($Items)
+    $ids = (@($Items | ForEach-Object { $_.Id })) -join ','
+    $names = (@($Items | ForEach-Object { $_.Name })) -join ', '
+    [long]$known = 0; $unknown = 0
+    foreach ($i in $Items) { if ([long]$i.Bytes -ge 0) { $known += [long]$i.Bytes } else { $unknown++ } }
+    $size = { param($i) if ([long]$i.Bytes -lt 0) { 'size unknown - needs admin to measure' } else { Format-WSize ([long]$i.Bytes) } }
+    $title = 'Computer Doctor - cleanups that need administrator rights'
+    $facts = @(
+        @('PC', $Info.Computer), @('Windows', $Info.Windows), @('User', $Info.User), @('System drive', $Info.Drive), @('Date', $Info.Date)
+    )
+    $total = 'About {0}{1}' -f (Format-WSize $known), $(if ($unknown) { " plus $unknown item(s) that need admin to measure" } else { '' })
+    $steps = @(
+        '1. Sign in to this PC as an administrator, or start ComputerDoctor.ps1 and enter an administrator''s password when Windows asks for administrator rights.',
+        '2. Open Cleaner.',
+        "3. Leave these ticked: $names.",
+        '4. Click Analyze, then Run Cleaner.'
+    )
+    $cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Clean {1} -Yes' -f $ScriptPath, $ids
+    $alt = 'Without Computer Doctor: Settings > System > Storage > Temporary files (as an administrator).'
+
+    $t = New-Object System.Text.StringBuilder
+    [void]$t.AppendLine($title).AppendLine()
+    foreach ($f in $facts) { [void]$t.AppendLine(('{0}: {1}' -f $f[0], $f[1])) }
+    [void]$t.AppendLine().AppendLine("What can be cleaned ($total):")
+    foreach ($i in $Items) { [void]$t.AppendLine(('- {0} ({1}): {2}' -f $i.Name, (& $size $i), $i.Desc)) }
+    [void]$t.AppendLine().AppendLine('Steps for the administrator:')
+    foreach ($s in $steps) { [void]$t.AppendLine($s) }
+    [void]$t.AppendLine().AppendLine('Or run this in an administrator terminal:').AppendLine('  ' + $cmd).AppendLine().AppendLine($alt)
+
+    $e = { param($x) [System.Net.WebUtility]::HtmlEncode([string]$x) }
+    $h = New-Object System.Text.StringBuilder
+    [void]$h.Append('<!DOCTYPE html><html><head><meta charset="utf-8"><title>').Append((& $e $title)).Append('</title>')
+    [void]$h.Append('<style>body{font-family:Segoe UI,Arial,sans-serif;max-width:760px;margin:32px auto;padding:0 16px;color:#111;line-height:1.45}')
+    [void]$h.Append('h1{font-size:22px}h2{font-size:16px;margin-top:24px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 8px;text-align:left;vertical-align:top}')
+    [void]$h.Append('th{background:#f2f2f2}code{display:block;background:#f4f4f4;border:1px solid #ddd;padding:8px;white-space:pre-wrap;word-break:break-all}.muted{color:#555}</style></head><body>')
+    [void]$h.Append('<h1>').Append((& $e $title)).Append('</h1><p class="muted">')
+    [void]$h.Append((($facts | ForEach-Object { '<b>' + (& $e $_[0]) + ':</b> ' + (& $e $_[1]) }) -join '<br>')).Append('</p>')
+    [void]$h.Append('<h2>What can be cleaned (').Append((& $e $total)).Append(')</h2><table><tr><th>Cleanup</th><th>Size</th><th>What it is</th></tr>')
+    foreach ($i in $Items) { [void]$h.Append('<tr><td>').Append((& $e $i.Name)).Append('</td><td>').Append((& $e (& $size $i))).Append('</td><td>').Append((& $e $i.Desc)).Append('</td></tr>') }
+    [void]$h.Append('</table><h2>Steps for the administrator</h2><ol>')
+    foreach ($s in $steps) { [void]$h.Append('<li>').Append((& $e ($s -replace '^\d+\.\s*', ''))).Append('</li>') }
+    [void]$h.Append('</ol><p>Or run this in an administrator terminal:</p><code>').Append((& $e $cmd)).Append('</code>')
+    [void]$h.Append('<p>').Append((& $e $alt)).Append('</p></body></html>')
+    @{ Text = $t.ToString(); Html = $h.ToString() }
+}
+
 function Test-WProcess($Item) {
     if (-not $Item.Process) { return $false }
     [bool](Get-Process -Name $Item.Process -ErrorAction SilentlyContinue)
@@ -4073,8 +4553,22 @@ function Test-WProcess($Item) {
 
 function Measure-WItem($Item) {
     $res = @{ Id = $Item.Id; Name = $Item.Name; Group = $Item.Group; Files = 0; Bytes = [long]0; Note = '' }
+    $subs = New-Object System.Collections.Generic.List[object]
     if (Test-WProcess $Item) { $res.Note = "$($Item.ProcessLabel) is running - close it before cleaning" }
     switch ($Item.Kind) {
+        'Found' {
+            # One line per program, under the rule's own line ("Zoom: 340 MB").
+            $procs = Get-WProcPaths
+            foreach ($set in (Find-WAppFolders $Item)) {
+                $n = 0; [long]$b = 0
+                foreach ($t in $set.Targets) { foreach ($f in (Get-WFoundFiles $t)) { $n++; $b += $f.Length } }
+                if (-not $n) { continue }
+                $res.Files += $n; $res.Bytes += $b
+                $subs.Add(@{ Id = $Item.Id; Name = $set.App; Group = $Item.Group; Files = $n; Bytes = $b; Sub = $true
+                             Note = $(if (Test-WAppRunning $set $procs) { "$($set.App) is running - close it before cleaning" } else { '' }) })
+            }
+            $res.Note = '{0} in {1}' -f (Format-WSize $res.Bytes), (Format-WAppCount $subs.Count)
+        }
         'Files' {
             foreach ($t in $Item.Targets) {
                 foreach ($f in (Get-WTargetFiles $t)) { $res.Files++; $res.Bytes += $f.Length }
@@ -4092,12 +4586,18 @@ function Measure-WItem($Item) {
         'Action' { if (-not $res.Note) { $res.Note = 'Action - runs during clean' } }
     }
     $res
+    foreach ($x in @($subs | Sort-Object { [long]$_.Bytes } -Descending)) { $x }
 }
 
 function Invoke-WClean($Item) {
     $res = @{ Id = $Item.Id; Name = $Item.Name; Group = $Item.Group; Files = 0; Bytes = [long]0; Failed = 0; Note = '' }
+    $subs = New-Object System.Collections.Generic.List[object]
     if (Test-WProcess $Item) {
+        # Skipped, with what it holds back and which apps are open (the Cleaner and automatic cleanup offer to close them).
         $res.Note = "Skipped - $($Item.ProcessLabel) is running"
+        $res.Skipped = $true
+        $res.Blockers = @(Get-WRuleBlockers $Item)
+        try { $res.Held = [long](@(Measure-WItem $Item) | Select-Object -First 1).Bytes } catch { $res.Held = [long]0 }
         Write-WLog "$($Item.Name): skipped, $($Item.ProcessLabel) is running" 'WARN'
         return $res
     }
@@ -4123,10 +4623,38 @@ function Invoke-WClean($Item) {
                             $res.Files++; $res.Bytes += $len
                         } catch { $res.Failed++ }
                     }
-                    if ($t.Recurse -ne $false) {
+                    if ($t.Recurse -ne $false -and -not $t.KeepDirs) {
                         foreach ($root in (Resolve-WTarget $t.Path)) { Remove-WEmptyDirs $root }
                     }
                 }
+            }
+            'Found' {
+                # Folders are left in place (only old files go); a program that is open is skipped.
+                $procs = Get-WProcPaths
+                $held = New-Object System.Collections.Generic.List[object]
+                foreach ($set in (Find-WAppFolders $Item)) {
+                    $files = @(foreach ($t in $set.Targets) { Get-WFoundFiles $t })
+                    if (-not $files.Count) { continue }
+                    if (Test-WAppRunning $set $procs) {
+                        [long]$hb = 0; foreach ($f in $files) { $hb += $f.Length }
+                        $res.Held = [long]$res.Held + $hb
+                        $held.Add(@{ Label = $set.App; Names = @($set.App); Tops = @($set.Tops); RuleId = $Item.Id; RuleName = $Item.Name })
+                        $subs.Add(@{ Id = $Item.Id; Name = $set.App; Group = $Item.Group; Files = 0; Bytes = [long]0; Sub = $true; Skipped = $true; Held = $hb; Note = "Skipped - $($set.App) is running" })
+                        Write-WLog "$($Item.Name): skipped $($set.App), it is running" 'WARN'
+                        continue
+                    }
+                    $n = 0; [long]$b = 0; $bad = 0
+                    foreach ($f in $files) {
+                        $len = $f.Length
+                        try { if ($f.IsReadOnly) { $f.IsReadOnly = $false }; $f.Delete(); $n++; $b += $len } catch { $bad++ }
+                    }
+                    $res.Files += $n; $res.Bytes += $b; $res.Failed += $bad
+                    $subs.Add(@{ Id = $Item.Id; Name = $set.App; Group = $Item.Group; Files = $n; Bytes = $b; Sub = $true
+                                 Note = $(if ($bad) { "$bad file(s) in use or locked - skipped" } else { '' }) })
+                }
+                if ($held.Count) { $res.Skipped = $true; $res.Blockers = @($held) }
+                $res.Note = '{0} in {1}' -f (Format-WSize $res.Bytes), (Format-WAppCount @($subs | Where-Object { -not $_.Skipped }).Count)
+                if ($held.Count) { $res.Note += "; skipped $(Format-WAppCount $held.Count) that are running" }
             }
             'RecycleBin' {
                 $m = Measure-WItem $Item
@@ -4151,6 +4679,7 @@ function Invoke-WClean($Item) {
     if ($res.Failed -gt 0 -and -not $res.Note) { $res.Note = "$($res.Failed) file(s) in use or locked - skipped" }
     Write-WLog ("{0}: removed {1} file(s), {2}" -f $Item.Name, $res.Files, (Format-WSize $res.Bytes))
     $res
+    foreach ($x in @($subs | Sort-Object { [long]$_.Bytes } -Descending)) { $x }
 }
 '@
 #endregion
@@ -4162,11 +4691,17 @@ function New-AWRule {
     @{ Id = $Id; Group = $Group; Name = $Name; Desc = $Desc; Kind = $Kind; Targets = @($Targets); Admin = $Admin; Default = $Default
        Service = $Service; Process = $Process; ProcessLabel = $ProcessLabel; Action = $Action }
 }
-function T([string]$Path, [string]$Filter = '*', [bool]$Recurse = $true, [int]$MinAgeHours = 0) {
-    @{ Path = $Path; Filter = $Filter; Recurse = $Recurse; MinAgeHours = $MinAgeHours }
+function T([string]$Path, [string]$Filter = '*', [bool]$Recurse = $true, [int]$MinAgeHours = 0, [bool]$KeepDirs = $false) {
+    @{ Path = $Path; Filter = $Filter; Recurse = $Recurse; MinAgeHours = $MinAgeHours; KeepDirs = $KeepDirs }
 }
 
 $chromium = { param($base) @( (T "$base\User Data\*\Cache\Cache_Data"), (T "$base\User Data\*\Code Cache"), (T "$base\User Data\*\GPUCache"), (T "$base\User Data\ShaderCache") ) }
+$swCache  = { param($base) @( (T "$base\User Data\*\Service Worker\CacheStorage"), (T "$base\User Data\*\Service Worker\ScriptCache") ) }
+
+# Rules found by looking (Kind 'Found'): programs' own log, temp and cache folders. Discover says where to look;
+# see Find-WAppFolders. Folders other rules cover are added as Covered below, so no file is counted twice.
+$userNever = @('%LOCALAPPDATA%\Temp', '%LOCALAPPDATA%\Packages', '%LOCALAPPDATA%\Microsoft\Windows', '%LOCALAPPDATA%\ComputerDoctor', '%LOCALAPPDATA%\AWiper', '%OneDrive%', '%OneDriveConsumer%', '%OneDriveCommercial%')
+$userBases = @('%LOCALAPPDATA%', '%APPDATA%', '%USERPROFILE%\AppData\LocalLow')
 
 $script:CleanerRules = @(
     New-AWRule 'UserTemp'   'Windows' 'User temp files'         'Files in your %TEMP% folder older than 24 hours.' -Targets (T '%TEMP%' -MinAgeHours 24)
@@ -4180,17 +4715,32 @@ $script:CleanerRules = @(
     New-AWRule 'WinUpdate'  'Windows' 'Windows Update cache'    'Downloaded update packages already installed. Briefly stops the Windows Update service.' -Targets (T '%SystemRoot%\SoftwareDistribution\Download') -Admin $true -Service 'wuauserv'
     New-AWRule 'DeliveryOp' 'Windows' 'Delivery Optimization'   'Peer-to-peer update cache. Briefly stops the Delivery Optimization service.' -Targets (T '%SystemRoot%\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache') -Admin $true -Default $false -Service 'DoSvc'
     New-AWRule 'Prefetch'   'Windows' 'Prefetch data'           'Launch-optimization data. The next few app launches may be slightly slower.' -Targets (T '%SystemRoot%\Prefetch' '*.pf' $false) -Admin $true -Default $false
-    New-AWRule 'WinLogs'    'Windows' 'Setup and CBS logs'      'Component servicing / DISM logs older than 24 hours.' -Targets @((T '%SystemRoot%\Logs\CBS' '*.log' $false 24), (T '%SystemRoot%\Logs\DISM' '*.log' $false 24)) -Admin $true -Default $false
+    New-AWRule 'WinLogs'    'Windows' 'Windows logs'            'Old Windows log files (servicing, setup, updates, Delivery Optimization). Only files older than 30 days; Windows starts new ones as needed.' -Targets @((T '%SystemRoot%\Logs' '*.log' $true 720 $true), (T '%SystemRoot%\Logs' '*.etl' $true 720 $true), (T '%SystemRoot%\Logs' '*.cab' $true 720 $true), (T '%ProgramData%\USOShared\Logs' '*.etl' $true 720 $true), (T '%SystemRoot%\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Logs' '*' $true 720 $true)) -Admin $true
     New-AWRule 'Shaders'    'Windows' 'GPU shader caches'       'DirectX, NVIDIA and AMD shader caches. Games rebuild them on next launch.' -Targets @((T '%LOCALAPPDATA%\D3DSCache'), (T '%LOCALAPPDATA%\NVIDIA\DXCache'), (T '%LOCALAPPDATA%\NVIDIA\GLCache'), (T '%LOCALAPPDATA%\AMD\DxCache')) -Default $false
+    New-AWRule 'INetCache'  'Windows' 'Internet cache'          'Cached web files used by Windows, Office and apps that show web pages; they are downloaded again when needed and files in use are skipped.' -Targets (T '%LOCALAPPDATA%\Microsoft\Windows\INetCache')
+    New-AWRule 'StoreAppCaches' 'Windows' 'Store app caches'    'Temporary and cached files of Microsoft Store apps, which the apps rebuild when needed.' -Targets @((T '%LOCALAPPDATA%\Packages\*\AC\INetCache'), (T '%LOCALAPPDATA%\Packages\*\AC\Temp'), (T '%LOCALAPPDATA%\Packages\*\TempState')) -Default $false
+    New-AWRule 'ProgramLogs' 'Windows' 'Program logs (all users)' 'Old log files that programs keep for all users in ProgramData. Only files older than 30 days.' -Kind 'Found' -Admin $true
 
     New-AWRule 'Edge'       'Browsers' 'Microsoft Edge cache'   'Cached web content, code cache and GPU cache. History, cookies and passwords are untouched.' -Targets (& $chromium '%LOCALAPPDATA%\Microsoft\Edge') -Process 'msedge' -ProcessLabel 'Edge'
     New-AWRule 'Chrome'     'Browsers' 'Google Chrome cache'    'Cached web content, code cache and GPU cache. History, cookies and passwords are untouched.' -Targets (& $chromium '%LOCALAPPDATA%\Google\Chrome') -Process 'chrome' -ProcessLabel 'Chrome'
     New-AWRule 'Brave'      'Browsers' 'Brave cache'            'Cached web content, code cache and GPU cache.' -Targets (& $chromium '%LOCALAPPDATA%\BraveSoftware\Brave-Browser') -Process 'brave' -ProcessLabel 'Brave'
     New-AWRule 'Firefox'    'Browsers' 'Firefox cache'          'Firefox cache2 folders for every profile.' -Targets (T '%LOCALAPPDATA%\Mozilla\Firefox\Profiles\*\cache2') -Process 'firefox' -ProcessLabel 'Firefox'
+    New-AWRule 'BrowserSW'  'Browsers' 'Browser service worker caches' 'Offline copies websites keep in Edge, Chrome and Brave; sites download again what they need.' -Targets (@(& $swCache '%LOCALAPPDATA%\Microsoft\Edge') + @(& $swCache '%LOCALAPPDATA%\Google\Chrome') + @(& $swCache '%LOCALAPPDATA%\BraveSoftware\Brave-Browser')) -Process @('msedge', 'chrome', 'brave') -ProcessLabel 'your browser' -Default $false
 
     New-AWRule 'Teams'      'Applications' 'Microsoft Teams cache' 'Classic and new Teams web caches.' -Targets @((T '%APPDATA%\Microsoft\Teams\Cache'), (T '%APPDATA%\Microsoft\Teams\Service Worker\CacheStorage'), (T '%LOCALAPPDATA%\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\*\Cache')) -Process @('Teams', 'ms-teams') -ProcessLabel 'Teams' -Default $false
     New-AWRule 'Discord'    'Applications' 'Discord cache'       'Discord web, code and GPU caches.' -Targets @((T '%APPDATA%\discord\Cache'), (T '%APPDATA%\discord\Code Cache'), (T '%APPDATA%\discord\GPUCache')) -Process 'Discord' -ProcessLabel 'Discord' -Default $false
     New-AWRule 'Steam'      'Applications' 'Steam web cache'     'Steam client browser cache (not games or shader pre-caches).' -Targets (T '%LOCALAPPDATA%\Steam\htmlcache') -Process 'steam' -ProcessLabel 'Steam' -Default $false
+    New-AWRule 'VSCode'     'Applications' 'Visual Studio Code cache' 'Caches Visual Studio Code keeps (web, code and GPU caches, cached data and extension downloads); it rebuilds them when needed.' -Targets @((T '%APPDATA%\Code\Cache'), (T '%APPDATA%\Code\Code Cache'), (T '%APPDATA%\Code\GPUCache'), (T '%APPDATA%\Code\CachedData'), (T '%APPDATA%\Code\CachedExtensionVSIXs')) -Process 'Code' -ProcessLabel 'VS Code' -Default $false
+    New-AWRule 'Slack'      'Applications' 'Slack cache'         'Slack web, code, GPU and offline caches, which Slack downloads again when needed.' -Targets @((T '%APPDATA%\Slack\Cache'), (T '%APPDATA%\Slack\Code Cache'), (T '%APPDATA%\Slack\GPUCache'), (T '%APPDATA%\Slack\Service Worker\CacheStorage')) -Process 'slack' -ProcessLabel 'Slack' -Default $false
+    New-AWRule 'Spotify'    'Applications' 'Spotify cache'       'Songs and data Spotify keeps for quicker playback; it downloads them again when needed (songs you downloaded for offline listening may need downloading again).' -Targets @((T '%LOCALAPPDATA%\Spotify\Storage'), (T '%LOCALAPPDATA%\Spotify\Data')) -Process 'Spotify' -ProcessLabel 'Spotify' -Default $false
+    New-AWRule 'OneDriveLogs' 'Applications' 'OneDrive logs'     'OneDrive log files older than 24 hours; OneDrive writes new ones as needed.' -Targets (T '%LOCALAPPDATA%\Microsoft\OneDrive\logs' '*' $true 24) -Default $false
+    New-AWRule 'AppLogs'    'Applications' "Other apps' logs and temp files" 'Old log files, temp files and crash reports that programs leave in your profile. Only files older than 7 days; nothing they need to run.' -Kind 'Found'
+    New-AWRule 'AppCaches'  'Applications' "Other apps' caches"  "Caches other programs keep in your profile. They're rebuilt when needed, so the next start of each program may be a little slower." -Kind 'Found' -Default $false
+
+    New-AWRule 'NpmCache'   'Developer' 'npm cache'              'Packages npm keeps after downloading them; npm downloads them again when needed.' -Targets @((T '%LOCALAPPDATA%\npm-cache'), (T '%APPDATA%\npm-cache')) -Default $false
+    New-AWRule 'PipCache'   'Developer' 'pip cache'              'Python packages pip keeps after downloading them; pip downloads them again when needed.' -Targets (T '%LOCALAPPDATA%\pip\Cache') -Default $false
+    New-AWRule 'NuGetCache' 'Developer' 'NuGet HTTP cache'       'Package downloads NuGet keeps (not the installed packages folder); NuGet downloads them again when needed.' -Targets @((T '%LOCALAPPDATA%\NuGet\v3-cache'), (T '%LOCALAPPDATA%\NuGet\plugins-cache')) -Default $false
+    New-AWRule 'YarnCache'  'Developer' 'Yarn cache'             'Packages Yarn keeps after downloading them; Yarn downloads them again when needed.' -Targets (T '%LOCALAPPDATA%\Yarn\Cache') -Default $false
 
     New-AWRule 'Recent'     'Privacy' 'Recent items list'       'Shortcuts in the Recent Items list (the files themselves are untouched).' -Targets (T '%APPDATA%\Microsoft\Windows\Recent' '*.lnk' $false) -Default $false
     New-AWRule 'Clipboard'  'Privacy' 'Clipboard'               'Clears the current clipboard contents.' -Kind 'Action' -Action 'Clipboard' -Default $false
@@ -4219,6 +4769,57 @@ if ($steamLibs.Count) {
     $r.UserScope = $true      # library paths are this PC's
     $at = [array]::FindIndex([object[]]$script:CleanerRules, [Predicate[object]]{ param($x) $x.Id -eq 'Steam' }) + 1
     $script:CleanerRules = @($script:CleanerRules[0..($at - 1)]) + @($r) + @($script:CleanerRules[$at..($script:CleanerRules.Count - 1)])
+}
+
+# Where the rules found by looking look. Logs = log / temp / crash-report folders, Cache = cache folders; the
+# same walk serves both, so AppLogs and AppCaches never count the same file.
+$covered = @($script:CleanerRules | Where-Object { $_.Kind -eq 'Files' } | ForEach-Object { $_.Targets } | ForEach-Object { $_.Path })
+foreach ($r in $script:CleanerRules) {
+    switch ($r.Id) {
+        'AppLogs' {
+            $r.UserScope = $true
+            $r.Discover = @{ Bases = $userBases; MaxDepth = 4; Take = 'Log'; MinAgeHours = 168; TopFiles = @('*.log', '*.log.old', '*.dmp'); NeverInside = $userNever
+                             Extra = @(@{ App = 'LocalLow Temp'; Path = '%USERPROFILE%\AppData\LocalLow\Temp'; MinAgeHours = 24 }) }
+        }
+        'AppCaches' {
+            $r.UserScope = $true
+            $r.Discover = @{ Bases = $userBases; MaxDepth = 4; Take = 'Cache'; MinAgeHours = 0; TopFiles = @(); NeverInside = $userNever
+                             Extra = @(@{ App = 'LocalLow Temp'; Path = '%USERPROFILE%\AppData\LocalLow\Temp'; MinAgeHours = 24 }) }
+        }
+        'ProgramLogs' {
+            $r.Discover = @{ Bases = @('%ProgramData%'); MaxDepth = 3; Take = 'Log'; MinAgeHours = 720; TopFiles = @('*.log'); LogNames = @('Logs', 'Log')
+                             NeverInside = @('%ProgramData%\Package Cache', '%ProgramData%\Microsoft\Windows\WER', '%ProgramData%\Microsoft\Windows Defender', '%ProgramData%\Microsoft\Crypto',
+                                             '%ProgramData%\Microsoft\Network', '%ProgramData%\ComputerDoctor', '%ProgramData%\AWiper') }
+        }
+    }
+    if ($r.Kind -eq 'Found') { $r.Covered = $covered }
+}
+#endregion
+
+#region ---------------------------------------------------------------- Automatic cleanup (shared by the window and -AutoClean)
+# Only rules that don't need admin can run automatically; the Recycle Bin is never chosen for you.
+function Get-AWAutoCleanDefaultIds { @($script:CleanerRules | Where-Object { $_.Default -and -not $_.Admin -and $_.Id -ne 'Recycle' } | ForEach-Object { $_.Id }) }
+function Get-AWAutoCleanRules {
+    $ids = @($script:State.AutoClean.Rules)
+    @($script:CleanerRules | Where-Object { -not $_.Admin -and $ids -contains $_.Id })
+}
+$script:AutoCleanTask = 'ComputerDoctor Auto Clean'
+
+# Records a finished run: last run / freed / result, and the reclaimed totals.
+function Save-AWAutoCleanRun([long]$Freed, [long]$Held = 0, [string[]]$OpenApps = @()) {
+    $ac = $script:State.AutoClean
+    $ac.LastRun = (Get-Date).ToString('o'); $ac.LastFreed = $Freed
+    $ac.LastResult = "Freed $(Format-AWSize $Freed)" + $(if (@($OpenApps).Count) { "; skipped $(Format-AWSize $Held) because these were open: $($OpenApps -join ', ')" } else { '' })
+    $script:State.TotalFreed += $Freed; $script:State.Cleans++; $script:State.LastClean = (Get-Date).ToString('o')
+    Save-AWState
+}
+# More freed after closing the apps that were open.
+function Add-AWAutoCleanFreed([long]$More, [string[]]$StillOpen = @()) {
+    $ac = $script:State.AutoClean
+    $ac.LastFreed = [long]$ac.LastFreed + $More
+    $ac.LastResult = "Freed $(Format-AWSize $ac.LastFreed) (after closing open apps)" + $(if (@($StillOpen).Count) { "; still open - skipped: $($StillOpen -join ', ')" } else { '' })
+    $script:State.TotalFreed += $More
+    Save-AWState
 }
 #endregion
 
@@ -4530,6 +5131,80 @@ function Read-AWConfig([string]$Path) {
     }
 }
 
+# After an automatic cleanup that skipped rules because their apps were open: a small topmost popup in the
+# bottom-right corner offering to close them (the way clicking X does) and clean what's left. Closes itself
+# after 10 minutes (= Not now). Only in an interactive session.
+function Show-AWAutoCleanPopup([long]$Freed, [long]$Held, $Blockers, $Rules) {
+    if (-not [Environment]::UserInteractive -or [Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') { return }
+    $apps = @($Blockers | ForEach-Object { $_.Label } | Select-Object -Unique)
+    [xml]$px = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Computer Doctor" Width="390" SizeToContent="Height" WindowStyle="None" ResizeMode="NoResize" Topmost="True"
+        ShowInTaskbar="False" AllowsTransparency="True" Background="Transparent" FontFamily="Segoe UI" ShowActivated="False">
+  <Border Background="#151922" BorderBrush="#2C3341" BorderThickness="1" CornerRadius="12" Padding="18,14" Margin="8">
+    <StackPanel>
+      <TextBlock Text="Computer Doctor" Foreground="#E6E9F0" FontWeight="SemiBold" FontSize="14"/>
+      <TextBlock x:Name="Msg" Foreground="#C9CEDA" TextWrapping="Wrap" Margin="0,8,0,0" FontSize="12.5"/>
+      <StackPanel x:Name="Btns" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
+        <Button x:Name="Later" Content="Not now" Padding="14,6" Margin="0,0,8,0" Background="#2C3341" Foreground="#E6E9F0" BorderThickness="0" Cursor="Hand"/>
+        <Button x:Name="Go" Content="Close them and clean" Padding="14,6" Background="#2563EB" Foreground="White" BorderThickness="0" Cursor="Hand"/>
+      </StackPanel>
+    </StackPanel>
+  </Border>
+</Window>
+'@
+    try { $w = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $px)) } catch { Write-WLog "Could not show the automatic cleanup popup: $($_.Exception.Message)" 'WARN'; return }
+    $script:AcPop = @{ Window = $w; Msg = $w.FindName('Msg'); Btns = $w.FindName('Btns'); Blockers = @($Blockers); Rules = @($Rules); Started = $null; Timer = $null }
+    $script:AcPop.Msg.Text = 'Automatic cleanup finished and freed {0}. {1} more is waiting because these are open: {2}. Close them now to finish?' -f (Format-AWSize $Freed), (Format-AWSize $Held), ($apps -join ', ')
+    $w.Add_Loaded({
+        $wa = [System.Windows.SystemParameters]::WorkArea
+        $script:AcPop.Window.Left = $wa.Right - $script:AcPop.Window.ActualWidth - 8
+        $script:AcPop.Window.Top = $wa.Bottom - $script:AcPop.Window.ActualHeight - 8
+    })
+    $w.FindName('Later').Add_Click({ $script:AcPop.Window.Close() })
+    $w.FindName('Go').Add_Click({
+        $p = $script:AcPop
+        $p.Btns.IsEnabled = $false
+        $p.Msg.Text = 'Closing ' + ((@($p.Blockers | ForEach-Object { $_.Label } | Select-Object -Unique)) -join ', ') + '...'
+        [void](Close-WBlockers $p.Blockers)
+        Write-WLog ('Automatic cleanup: asked ' + ((@($p.Blockers | ForEach-Object { $_.Label } | Select-Object -Unique)) -join ', ') + ' to close')
+        $p.Started = Get-Date
+        $p.Timer.Interval = [TimeSpan]::FromMilliseconds(500)
+        $p.Timer.Tag = 'closing'
+        $p.Timer.Start()
+    })
+    # One timer: the 10-minute auto-close, then the wait for apps to close (up to 15 s), then 5 s showing the result.
+    $t = New-Object System.Windows.Threading.DispatcherTimer
+    $t.Interval = [TimeSpan]::FromMinutes(10); $t.Tag = 'idle'
+    $t.Add_Tick({
+        $p = $script:AcPop
+        switch ($p.Timer.Tag) {
+            'closing' {
+                $open = @(Get-WOpenBlockers $p.Blockers)
+                if ($open.Count -and ((Get-Date) - $p.Started).TotalSeconds -lt 15) { return }
+                $p.Timer.Stop()
+                [long]$more = 0
+                foreach ($rule in $p.Rules) {
+                    try { foreach ($r in @(Invoke-WClean $rule | Where-Object { $_ -is [hashtable] -and -not $_.Sub })) { $more += [long]$r.Bytes } }
+                    catch { Write-WLog "$($rule.Name): $($_.Exception.Message)" 'ERROR' }
+                }
+                Add-AWAutoCleanFreed $more $open
+                Write-AWAction 'AutoClean' @($p.Rules | ForEach-Object { $_.Id }) @{ Bytes = $more; AfterClosingApps = $true; StillOpen = $open } 'Done'
+                $p.Msg.Text = "Freed $(Format-AWSize $more) more." + $(if ($open.Count) { " Still open - skipped: $($open -join ', ')." } else { '' })
+                $p.Timer.Tag = 'done'; $p.Timer.Interval = [TimeSpan]::FromSeconds(5); $p.Timer.Start()
+            }
+            default { $p.Timer.Stop(); $p.Window.Close() }
+        }
+    })
+    $script:AcPop.Timer = $t
+    $t.Start()
+    [void]$w.ShowDialog()
+    $t.Stop()
+    $line = $null; $buf = New-Object System.Text.StringBuilder
+    while ($Sync.Log.TryDequeue([ref]$line)) { [void]$buf.AppendLine($line) }
+    try { [IO.File]::AppendAllText($script:LogFile, $buf.ToString()) } catch { }
+}
+
 function Invoke-AWCli {
     $Sync.Echo = ($Format -eq 'Text')
     . ([scriptblock]::Create($Sync.WorkerLib))
@@ -4717,6 +5392,43 @@ function Invoke-AWCli {
         }
     }
 
+    # ---- automatic cleanup (the scheduled task): the rules chosen in Cleaner > Automatic cleanup, never admin rules.
+    # It is set up in the window, so it runs without -Yes. Apps that are open are skipped, then offered in a popup.
+    if ($AutoClean) {
+        Write-AWCli "`nAutomatic cleanup" Cyan
+        $ac = $script:State.AutoClean
+        if ($remote) { Write-AWCli '  Automatic cleanup runs on this PC only.' Red; $failed = $true }
+        elseif (-not $ac.Enabled) { Write-AWCli '  Automatic cleanup is turned off (Cleaner > Automatic cleanup) - nothing to do.' Yellow }
+        else {
+            $acRules = @(Get-AWAutoCleanRules)
+            $acItems = @(); [long]$acTotal = 0; [long]$acHeld = 0; $acBlockers = @(); $acBlocked = @()
+            foreach ($rule in $acRules) {
+                try {
+                    $rows = @(Invoke-WClean $rule | Where-Object { $_ -is [hashtable] })
+                    $r = @($rows | Where-Object { -not $_.Sub }) | Select-Object -First 1
+                    Write-AWCli ('  {0,10}  {1,-28} {2}' -f (Format-AWSize ([long]$r.Bytes)), $rule.Name, $r.Note)
+                    foreach ($x in @($rows | Where-Object { $_.Sub })) { Write-AWCli ('  {0,10}    {1,-26} {2}' -f (Format-AWSize ([long]$x.Bytes)), $x.Name, $x.Note) }
+                    $acTotal += [long]$r.Bytes
+                    if ($r.Skipped) { $acHeld += [long]$r.Held; $acBlockers += @($r.Blockers | Where-Object { $_ }); $acBlocked += $rule }
+                    $acItems += [ordered]@{ Id = $rule.Id; Name = $rule.Name; Files = [long]$r.Files; Bytes = [long]$r.Bytes; Note = [string]$r.Note }
+                } catch { Write-AWCli "  failed   $($rule.Name): $($_.Exception.Message)" Red; $failed = $true }
+            }
+            $acApps = @($acBlockers | ForEach-Object { $_.Label } | Select-Object -Unique)
+            Save-AWAutoCleanRun $acTotal $acHeld $acApps
+            Write-AWAction 'AutoClean' @($acRules | ForEach-Object { $_.Id }) @{ Bytes = $acTotal; SkippedOpen = $acApps } 'Done'
+            Write-AWCli ('  {0} freed' -f (Format-AWSize $acTotal)) Green
+            if ($acApps.Count) { Write-AWCli ('  {0} more is waiting because these are open: {1}' -f (Format-AWSize $acHeld), ($acApps -join ', ')) Yellow }
+            $result.Steps += [ordered]@{ Step = 'AutoClean'; Items = $acItems; TotalBytes = $acTotal; WaitingBytes = $acHeld; OpenApps = $acApps }
+            if ($acApps.Count) {
+                # Flush the log first: the popup can stay up for a while.
+                $line = $null; $buf = New-Object System.Text.StringBuilder
+                while ($Sync.Log.TryDequeue([ref]$line)) { [void]$buf.AppendLine($line) }
+                try { [IO.File]::AppendAllText($script:LogFile, $buf.ToString()) } catch { }
+                Show-AWAutoCleanPopup $acTotal $acHeld $acBlockers $acBlocked
+            }
+        }
+    }
+
     # ---- restore point (explicit, or automatic before tweaks / app removal)
     $rpDesc = $want.RestorePoint
     if (-not $rpDesc -and $Yes -and ($want.ApplyTweaks.Count -or $want.RemoveApps.Count)) { $rpDesc = Get-AWAutoRP 'command-line changes' }
@@ -4736,14 +5448,16 @@ function Invoke-AWCli {
         Write-AWCli $(if ($doClean) { "`nCleaning" } else { "`nAnalyzing (nothing is deleted)" }) Cyan
         $items = @()
         foreach ($rule in $rules) {
-            $userScope = $rule.Kind -eq 'RecycleBin' -or $rule.Action -eq 'Clipboard' -or @($rule.Targets | Where-Object { $_.Path -match '%(TEMP|LOCALAPPDATA|APPDATA|USERPROFILE)%' }).Count
+            $userScope = $rule.UserScope -or $rule.Kind -eq 'RecycleBin' -or $rule.Action -eq 'Clipboard' -or @($rule.Targets | Where-Object { $_.Path -match '%(TEMP|LOCALAPPDATA|APPDATA|USERPROFILE)%' }).Count
             if ($remote -and $userScope) { Write-AWCli "  skipped  $($rule.Name) (per-user, this PC only)" Gray; continue }
             if ($rule.Admin -and -not $canAdmin) { Write-AWCli "  skipped  $($rule.Name) (needs admin)" Gray; continue }
             try {
                 $r = if ($doClean) { Invoke-WTarget { param($x) Invoke-WClean $x } -ArgumentList @(, $rule) } else { Invoke-WTarget { param($x) Measure-WItem $x } -ArgumentList @(, $rule) }
-                $r = @($r | Where-Object { $_ -is [hashtable] -or $_.Bytes -ne $null }) | Select-Object -Last 1
+                $rows = @($r | Where-Object { $_ -is [hashtable] -or $_.Bytes -ne $null })
+                $r = @($rows | Where-Object { -not $_.Sub }) | Select-Object -Last 1
                 Write-AWCli ('  {0,10}  {1,-28} {2}' -f (Format-AWSize ([long]$r.Bytes)), $rule.Name, $r.Note)
-                $items += [ordered]@{ Id = $rule.Id; Name = $rule.Name; Files = [long]$r.Files; Bytes = [long]$r.Bytes; Note = [string]$r.Note }
+                $apps = @($rows | Where-Object { $_.Sub } | ForEach-Object { Write-AWCli ('  {0,10}    {1,-26} {2}' -f (Format-AWSize ([long]$_.Bytes)), $_.Name, $_.Note); [ordered]@{ Name = [string]$_.Name; Files = [long]$_.Files; Bytes = [long]$_.Bytes; Note = [string]$_.Note } })
+                $items += [ordered]@{ Id = $rule.Id; Name = $rule.Name; Files = [long]$r.Files; Bytes = [long]$r.Bytes; Note = [string]$r.Note; Apps = $apps }
             } catch { Write-AWCli "  failed   $($rule.Name): $($_.Exception.Message)" Red; $failed = $true }
         }
         [long]$total = 0; foreach ($i in $items) { $total += $i.Bytes }
@@ -4812,6 +5526,9 @@ function Invoke-AWCli {
 }
 
 if ($script:CliMode) {
+    # The automatic cleanup popup's button handlers call worker functions; load them at script level too so the
+    # handlers find them whichever scope they run in.
+    if ($AutoClean) { . ([scriptblock]::Create($Sync.WorkerLib)) }
     $code = Invoke-AWCli
     exit ([int](@($code)[-1]))
 }
@@ -5893,17 +6610,20 @@ if ($script:CliMode) {
             <Grid Grid.Column="1" Margin="16,0,0,0">
               <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
               </Grid.RowDefinitions>
               <Border Style="{StaticResource Card}" Padding="24,20">
                 <Grid>
                   <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                  <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                  <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                   <StackPanel>
                     <TextBlock x:Name="CleanSummary" Text="Ready to analyze" FontSize="30" FontWeight="Bold"/>
                     <TextBlock x:Name="CleanSubtext" Text="Pick the rules on the left, then Analyze to see what can be removed." Style="{StaticResource Muted}" Margin="0,4,0,0"/>
                   </StackPanel>
                   <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button x:Name="BtnAdminReport" Content="Report for an administrator" Margin="0,0,10,0" Padding="14,10" Visibility="Collapsed"
+                            ToolTip="A page listing the cleanups that need administrator rights, with short steps for someone who has them"/>
                     <Button x:Name="BtnAnalyze" Margin="0,0,10,0" Padding="20,10">
                       <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE721;" Style="{StaticResource Icon}" Margin="0,0,8,0"/><TextBlock Text="Analyze"/></StackPanel>
                     </Button>
@@ -5912,9 +6632,48 @@ if ($script:CliMode) {
                     </Button>
                   </StackPanel>
                   <ProgressBar x:Name="CleanProgress" Grid.Row="1" Grid.ColumnSpan="2" Margin="0,18,0,0" Maximum="100" Value="0"/>
+                  <StackPanel x:Name="AdminReportBar" Grid.Row="2" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,12,0,0" Visibility="Collapsed">
+                    <Button x:Name="BtnAdminReportCopy" Content="Copy as text" Style="{StaticResource BtnChip}" Visibility="Collapsed"/>
+                    <TextBlock x:Name="AdminReportInfo" Text="" Style="{StaticResource Muted}" FontSize="12" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                  </StackPanel>
                 </Grid>
               </Border>
-              <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,16,0,16" Padding="12,10">
+              <!-- Automatic cleanup: a scheduled task for this account, running only rules that don't need admin -->
+              <Border x:Name="AcCard" Grid.Row="1" Style="{StaticResource Card}" Margin="0,16,0,0" Padding="20,14">
+                <StackPanel>
+                  <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <StackPanel VerticalAlignment="Center">
+                      <TextBlock Text="Automatic cleanup" FontSize="15" FontWeight="SemiBold"/>
+                      <TextBlock x:Name="AcSummary" Text="" Style="{StaticResource Muted}" FontSize="12" Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                      <Button x:Name="AcMore" Content="Settings" Style="{StaticResource BtnChip}"/>
+                      <Button x:Name="AcRunNow" Content="Run now" Style="{StaticResource BtnChip}"/>
+                    </StackPanel>
+                    <CheckBox x:Name="AcOn" Grid.Column="2" Style="{StaticResource Switch}" VerticalAlignment="Center" Margin="8,0,0,0"
+                              ToolTip="Cleans the rules you choose on a schedule, for your account only (no administrator rights needed)"/>
+                  </Grid>
+                  <StackPanel x:Name="AcDetails" Visibility="Collapsed" Margin="0,12,0,0">
+                    <StackPanel Orientation="Horizontal">
+                      <TextBlock Text="Run" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                      <ComboBox x:Name="AcDay" Width="130">
+                        <ComboBoxItem Content="Daily"/><ComboBoxItem Content="Monday"/><ComboBoxItem Content="Tuesday"/><ComboBoxItem Content="Wednesday"/>
+                        <ComboBoxItem Content="Thursday"/><ComboBoxItem Content="Friday"/><ComboBoxItem Content="Saturday"/><ComboBoxItem Content="Sunday"/>
+                      </ComboBox>
+                      <TextBlock Text="at" VerticalAlignment="Center" Margin="8,0"/>
+                      <TextBox x:Name="AcTime" Width="70" Text="12:00" ToolTip="HH:mm"/>
+                    </StackPanel>
+                    <TextBlock Text="RULES" Style="{StaticResource Caps}" Margin="0,12,0,4"/>
+                    <WrapPanel x:Name="AcRules"/>
+                    <TextBlock Text="Runs as you while you're signed in; a missed run catches up when the PC is next on. Apps that are open are skipped and you're asked to close them. Rules that need administrator rights can't run automatically."
+                               Style="{StaticResource Muted}" FontSize="11.5" Margin="0,8,0,0" TextWrapping="Wrap"/>
+                  </StackPanel>
+                  <TextBlock x:Name="AcRemoteNote" Visibility="Collapsed" Style="{StaticResource Muted}" FontSize="12" Margin="0,6,0,0" TextWrapping="Wrap"
+                             Text="Automatic cleanup is for this PC. Switch back to this PC (title bar) to set it up."/>
+                </StackPanel>
+              </Border>
+              <Border Grid.Row="2" Style="{StaticResource Card}" Margin="0,16,0,16" Padding="12,10">
                 <DockPanel>
                   <TextBlock DockPanel.Dock="Bottom" Text="Browser history, cookies, sessions and saved passwords are never touched. Items marked ADMIN need an elevated session." Style="{StaticResource Muted}" FontSize="11.5" Margin="8,8,8,2"/>
                   <ListView x:Name="CleanResults">
@@ -5999,14 +6758,31 @@ if ($script:CliMode) {
                       </StackPanel>
                     </Grid>
                   </Border>
-                  <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="4,10,0,0">
-                    <Border Width="12" Height="12" CornerRadius="3" Background="{StaticResource PurpleGrad}"/>
-                    <TextBlock Text="Folders" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="6,0,16,0"/>
-                    <Border Width="12" Height="12" CornerRadius="3" Background="{StaticResource TealGrad}"/>
-                    <TextBlock Text="Files (1 MB+)" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="6,0,16,0"/>
-                    <Border Width="12" Height="12" CornerRadius="3" Background="#2C3341"/>
-                    <TextBlock Text="Small files, grouped" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="6,0,0,0"/>
-                  </StackPanel>
+                  <Grid Grid.Row="2" Margin="4,10,0,0">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <WrapPanel VerticalAlignment="Center">
+                      <StackPanel Orientation="Horizontal" Margin="0,2">
+                        <Border Width="12" Height="12" CornerRadius="3" Background="{StaticResource PurpleGrad}"/>
+                        <TextBlock Text="Folders" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="6,0,16,0"/>
+                        <Border Width="12" Height="12" CornerRadius="3" Background="{StaticResource TealGrad}"/>
+                        <TextBlock Text="Files (1 MB+)" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="6,0,16,0"/>
+                        <Border Width="12" Height="12" CornerRadius="3" Background="#2C3341"/>
+                        <TextBlock Text="Small files, grouped" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="6,0,16,0"/>
+                      </StackPanel>
+                      <StackPanel x:Name="MapHlLegend" Orientation="Horizontal" Margin="0,2" Visibility="Collapsed">
+                        <Border Width="12" Height="12" CornerRadius="3" Background="#166534" BorderBrush="#4ADE80" BorderThickness="2"/>
+                        <TextBlock Text="You can clean" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="6,0,16,0"/>
+                        <Border Width="12" Height="12" CornerRadius="3" Background="#7F1D1D" BorderBrush="#F87171" BorderThickness="2"/>
+                        <TextBlock Text="Your account can't delete" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="6,0,0,0"/>
+                      </StackPanel>
+                    </WrapPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0">
+                      <TextBlock x:Name="MapHlNote" Text="Highlighting works on this PC only" Foreground="{StaticResource DimBrush}" FontSize="12" VerticalAlignment="Center" Margin="0,0,10,0" Visibility="Collapsed"/>
+                      <TextBlock Text="Highlight what you can clean" Foreground="{StaticResource MutedBrush}" FontSize="12" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                      <CheckBox x:Name="MapHighlight" Style="{StaticResource Switch}" IsChecked="True"
+                                ToolTip="Green: junk a cleaner rule removes, or old installers in Downloads. Red: folders your account can't delete."/>
+                    </StackPanel>
+                  </Grid>
                 </Grid>
               </Border>
               <ScrollViewer Grid.Column="1" VerticalScrollBarVisibility="Auto" Margin="16,0,0,0">
@@ -6018,11 +6794,14 @@ if ($script:CliMode) {
                       <TextBlock x:Name="MapSelPath" Text="" Style="{StaticResource Muted}" FontSize="11.5" Margin="0,3,0,0"/>
                       <TextBlock x:Name="MapSelSize" Text="" FontSize="26" FontWeight="Bold" Foreground="{StaticResource TealBrush}" Margin="0,10,0,0"/>
                       <TextBlock x:Name="MapSelMeta" Text="" Style="{StaticResource Muted}" FontSize="12"/>
+                      <TextBlock x:Name="MapSelReason" Text="" FontSize="12" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,6,0,0" Visibility="Collapsed"/>
                       <WrapPanel Margin="0,12,0,0">
+                        <Button x:Name="MapOpenCleaner" Content="Open Cleaner" Style="{StaticResource BtnChip}" Visibility="Collapsed"/>
                         <Button x:Name="MapOpen" Content="Open" Style="{StaticResource BtnChip}" IsEnabled="False"/>
                         <Button x:Name="MapZoom" Content="Zoom in" Style="{StaticResource BtnChip}" IsEnabled="False"/>
                         <Button x:Name="MapRecycle" Content="Recycle" Style="{StaticResource BtnChip}" IsEnabled="False" BorderBrush="#F87171"/>
                       </WrapPanel>
+                      <TextBlock x:Name="MapDenied" Text="" Foreground="#F87171" FontSize="12" TextWrapping="Wrap" Margin="0,10,0,0" Visibility="Collapsed"/>
                     </StackPanel>
                   </Border>
                   <Border Style="{StaticResource Card}" Margin="0,14,0,0">
@@ -6666,18 +7445,26 @@ if ($script:CliMode) {
             <Border Style="{StaticResource Card}" Padding="14,12">
               <Grid>
                 <Grid.ColumnDefinitions><ColumnDefinition Width="320"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                 <Grid>
                   <TextBox x:Name="ProgSearch" Tag="Search programs or publishers..." Padding="10,7,44,7"/>
                   <Border HorizontalAlignment="Right" Width="38" Margin="0,1,1,1" CornerRadius="0,7,7,0" Background="{StaticResource PurpleGrad}" IsHitTestVisible="False">
                     <TextBlock Text="&#xE721;" Style="{StaticResource Icon}" HorizontalAlignment="Center" Foreground="White"/>
                   </Border>
                 </Grid>
-                <TextBlock x:Name="ProgInfo" Grid.Column="1" Text="" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="16,0"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0">
+                  <RadioButton x:Name="ProgForAll"   Style="{StaticResource SegBtn}" GroupName="ProgFor" IsChecked="True" Content="All"/>
+                  <RadioButton x:Name="ProgForMe"    Style="{StaticResource SegBtn}" GroupName="ProgFor" Content="Just me" ToolTip="Installed for this account only"/>
+                  <RadioButton x:Name="ProgForUsers" Style="{StaticResource SegBtn}" GroupName="ProgFor" Content="All users" ToolTip="Installed for everyone on this PC"/>
+                  <TextBlock x:Name="ProgInfo" Text="" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="16,0,0,0" TextTrimming="CharacterEllipsis"/>
+                </StackPanel>
                 <StackPanel Grid.Column="2" Orientation="Horizontal">
                   <Button x:Name="ProgRefresh" Content="Refresh" Style="{StaticResource BtnChip}"/>
                   <Button x:Name="ProgOpen" Content="Open folder" Style="{StaticResource BtnChip}"/>
                   <Button x:Name="ProgUninstall" Content="Uninstall" Style="{StaticResource BtnPurple}" Padding="14,6" FontSize="12"/>
                 </StackPanel>
+                <TextBlock x:Name="ProgNote" Grid.Row="1" Grid.ColumnSpan="3" Visibility="Collapsed" Style="{StaticResource Muted}" FontSize="12" Margin="2,10,0,0"
+                           Text="Programs installed just for you can be uninstalled without administrator rights."/>
               </Grid>
             </Border>
             <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,16,0,16" Padding="12,10">
@@ -6695,7 +7482,7 @@ if ($script:CliMode) {
                     <GridViewColumn Header="Size" Width="90">
                       <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SizeText}" TextAlignment="Right" Foreground="#60A5FA"/></DataTemplate></GridViewColumn.CellTemplate>
                     </GridViewColumn>
-                    <GridViewColumn Header="Scope" Width="90" DisplayMemberBinding="{Binding Scope}"/>
+                    <GridViewColumn Header="Installed for" Width="100" DisplayMemberBinding="{Binding For}"/>
                   </GridView>
                 </ListView.View>
               </ListView>
@@ -7611,6 +8398,7 @@ foreach ($v in $script:ViewTitles.Keys) {
             }
         }
         if ($name -eq 'Map') { Request-AWMapRedraw }
+        if ($name -eq 'Cleaner') { Update-AWAutoCleanFromDisk; Update-AWAutoCleanSummary }
     })
 }
 
@@ -7866,6 +8654,9 @@ function Initialize-AWCleaner {
         [void]$ui.CleanerItems.Children.Add($cb)
         $script:CleanerChecks.Add($cb)
     }
+    $ui.BtnAdminReport.Visibility = if (-not $script:IsAdmin -and -not (Test-AWRemote)) { 'Visible' } else { 'Collapsed' }
+    if (Test-AWRemote) { $ui.AdminReportBar.Visibility = 'Collapsed' }
+    Update-AWAutoCleanCard
 }
 
 function Get-AWSelectedRules {
@@ -7876,27 +8667,34 @@ function Set-AWCleanerBusy([bool]$Busy) {
     $script:CleanerBusy = $Busy
     $ui.BtnAnalyze.IsEnabled = -not $Busy
     $ui.BtnClean.IsEnabled   = -not $Busy
+    $ui.BtnAdminReport.IsEnabled = -not $Busy
+    $ui.AcRunNow.IsEnabled = -not $Busy -and -not (Test-AWRemote)
     foreach ($cb in $script:CleanerChecks) { if (Test-AWRuleAllowed $cb.Tag) { $cb.IsEnabled = -not $Busy } }
 }
 
 function Show-AWCleanResults($Result, [string]$Mode) {
     $rows = New-Object System.Collections.Generic.List[object]
+    $subs = @{}
     [long]$total = 0; [long]$files = 0
     foreach ($r in $Result) {
-        if ($null -eq $r) { continue }
-        $total += [long]$r.Bytes; $files += [long]$r.Files
-        $dot = if ($r.Note -match 'running|Skipped|Error') { $script:Res.Amber } elseif ([long]$r.Bytes -gt 0) { $script:Res.Teal } else { $script:Res.Dim }
-        $rows.Add([pscustomobject]@{
-            Name  = $r.Name
+        if ($null -eq $r -or $null -eq $r.Name) { continue }
+        $dot = if ($r.Note -match 'running|Skipped|skipped|Error') { $script:Res.Amber } elseif ([long]$r.Bytes -gt 0) { $script:Res.Teal } else { $script:Res.Dim }
+        $row = [pscustomobject]@{
+            Name  = $(if ($r.Sub) { '      ' + $r.Name } else { $r.Name })
             Group = $r.Group
             Files = '{0:N0}' -f [long]$r.Files
             Size  = Format-AWSize ([long]$r.Bytes)
             Note  = $r.Note
             Dot   = $dot
             Bytes = [long]$r.Bytes
-        })
+            Id    = $r.Id
+        }
+        # Per-app lines of the rules found by looking go under their rule's line and aren't counted twice.
+        if ($r.Sub) { if (-not $subs[$r.Id]) { $subs[$r.Id] = New-Object System.Collections.Generic.List[object] }; $subs[$r.Id].Add($row); continue }
+        $total += [long]$r.Bytes; $files += [long]$r.Files
+        $rows.Add($row)
     }
-    $ui.CleanResults.ItemsSource = @($rows | Sort-Object Bytes -Descending)
+    $ui.CleanResults.ItemsSource = @(foreach ($row in @($rows | Sort-Object Bytes -Descending)) { $row; if ($subs[$row.Id]) { $subs[$row.Id] } })
     $ui.CleanProgress.Value = 100
 
     if ($Mode -eq 'Analyze') {
@@ -7906,11 +8704,25 @@ function Show-AWCleanResults($Result, [string]$Mode) {
     } else {
         $ui.CleanSummary.Text = '{0} freed' -f (Format-AWSize $total)
         $ui.CleanSubtext.Text = '{0:N0} files removed. Files that were in use were skipped safely.' -f $files
-        Write-AWAction 'Clean' ($rows | ForEach-Object Name) @{ Bytes = $total; Files = $files } 'Done'
-        $script:State.TotalFreed += $total
-        $script:State.Cleans++
-        $script:State.LastClean = (Get-Date).ToString('o')
-        Save-AWState
+        if ($Mode -eq 'Auto') {
+            # "Run now" of automatic cleanup: recorded like a scheduled run (last run, what it freed, what was skipped).
+            [long]$held = 0; $open = @()
+            foreach ($r in $Result) {
+                if (-not ($r -is [hashtable]) -or -not $r.Skipped) { continue }
+                if ($r.Sub) { $open += $r.Name; continue }
+                $held += [long]$r.Held; $open += @($r.Blockers | ForEach-Object { $_.Label })
+            }
+            $open = @($open | Where-Object { $_ } | Select-Object -Unique)
+            Write-AWAction 'AutoClean' ($rows | ForEach-Object Id) @{ Bytes = $total; Files = $files; SkippedOpen = $open; RunNow = $true } 'Done'
+            Save-AWAutoCleanRun $total $held $open
+            Update-AWAutoCleanSummary
+        } else {
+            Write-AWAction 'Clean' ($rows | ForEach-Object Name) @{ Bytes = $total; Files = $files } 'Done'
+            $script:State.TotalFreed += $total
+            $script:State.Cleans++
+            $script:State.LastClean = (Get-Date).ToString('o')
+            Save-AWState
+        }
         Update-AWDashboard
         $script:IdleStatus = "Clean complete - $(Format-AWSize $total) freed"
     }
@@ -7941,10 +8753,75 @@ function Start-AWAnalyze {
     }
 }
 
-function Start-AWClean {
+function Start-AWClean($Rules = $null, [string]$Mode = 'Clean') {
     if ($script:CleanerBusy) { return }
-    $rules = Get-AWSelectedRules
+    $rules = if ($null -ne $Rules) { @($Rules) } else { Get-AWSelectedRules }
     if ($rules.Count -eq 0) { Show-AWMessage 'Select at least one cleaning rule first.'; return }
+    $script:CleanMode = $Mode
+    if (Test-AWRemote) { Confirm-AWClean $rules @(); return }
+    # On this PC, look for apps that are open first: their rules would be skipped, so offer to close them.
+    $script:PendingCleanRules = $rules
+    Set-AWCleanerBusy $true
+    $ui.CleanSubtext.Text = 'Checking for open apps...'
+    Start-AWTask -Name 'Check open apps' -Arguments @{ Rules = $rules } -Work {
+        foreach ($rule in $Rules) {
+            if (-not $rule.Process -and $rule.Kind -ne 'Found') { continue }
+            $bl = @(Get-WRuleBlockers $rule)
+            if (-not $bl.Count) { continue }
+            if ($rule.Kind -eq 'Found') {
+                foreach ($b in $bl) { [long]$n = 0; foreach ($t in $b.Set.Targets) { foreach ($f in (Get-WFoundFiles $t)) { $n += $f.Length } }; $b.Bytes = $n; $b.Remove('Set'); $b }
+            } else {
+                $m = try { [long](@(Measure-WItem $rule) | Select-Object -First 1).Bytes } catch { [long]0 }
+                $first = $true
+                foreach ($b in $bl) { $b.Bytes = $(if ($first) { $m } else { [long]0 }); $first = $false; $b }
+            }
+        }
+    } -OnComplete {
+        param($Result)
+        Set-AWCleanerBusy $false
+        $ui.CleanSubtext.Text = ''
+        Confirm-AWClean $script:PendingCleanRules @($Result | Where-Object { $_ -is [hashtable] -and $_.Label })
+    }
+}
+
+# "Close these apps to clean them": returns 'Close', 'Rest' or 'Cancel'.
+function Show-AWCloseAppsDialog($Blockers) {
+    [xml]$dx = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Close these apps to clean them" Width="480" SizeToContent="Height" WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        Background="#151922" Foreground="#E6E9F0" FontFamily="Segoe UI" ShowInTaskbar="False">
+  <StackPanel Margin="22,18">
+    <TextBlock Text="Close these apps to clean them" FontSize="17" FontWeight="SemiBold"/>
+    <ItemsControl x:Name="Apps" Margin="0,12,0,0">
+      <ItemsControl.ItemTemplate><DataTemplate><TextBlock Text="{Binding}" Margin="0,3" TextWrapping="Wrap" FontWeight="SemiBold"/></DataTemplate></ItemsControl.ItemTemplate>
+    </ItemsControl>
+    <TextBlock Text="They close normally, as if you clicked X. Browsers bring your tabs back next time; anything unsaved will ask first."
+               Foreground="#AEB4C2" TextWrapping="Wrap" Margin="0,12,0,0" FontSize="12.5"/>
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+      <Button x:Name="BCancel" Content="Cancel" Padding="14,7" Margin="0,0,8,0" Background="#2C3341" Foreground="#E6E9F0" BorderThickness="0" IsCancel="True"/>
+      <Button x:Name="BRest" Content="Clean the rest" Padding="14,7" Margin="0,0,8,0" Background="#2C3341" Foreground="#E6E9F0" BorderThickness="0"/>
+      <Button x:Name="BClose" Content="Close them and clean" Padding="14,7" Background="#2563EB" Foreground="White" BorderThickness="0" IsDefault="True"/>
+    </StackPanel>
+  </StackPanel>
+</Window>
+'@
+    $d = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $dx))
+    $d.Owner = $window
+    $lines = foreach ($g in @($Blockers | Group-Object { $_.Label })) {
+        [long]$b = 0; foreach ($x in $g.Group) { $b += [long]$x.Bytes }
+        '{0} - {1}{2}' -f $g.Name, ((@($g.Group | ForEach-Object { $_.RuleName } | Select-Object -Unique)) -join ', '), $(if ($b -gt 0) { ', ' + (Format-AWSize $b) } else { '' })
+    }
+    $d.FindName('Apps').ItemsSource = @($lines)
+    $script:CloseAppsAnswer = 'Cancel'
+    $d.FindName('BClose').Add_Click({ $script:CloseAppsAnswer = 'Close'; $script:CloseAppsDlg.Close() })
+    $d.FindName('BRest').Add_Click({ $script:CloseAppsAnswer = 'Rest'; $script:CloseAppsDlg.Close() })
+    $script:CloseAppsDlg = $d
+    [void]$d.ShowDialog()
+    $script:CloseAppsAnswer
+}
+
+function Confirm-AWClean($Rules, $Blockers) {
+    $rules = @($Rules); $closeFirst = @()
     $names = ($rules | ForEach-Object { "  - $($_.Name)" }) -join "`n"
     $where = if (Test-AWRemote) { " on $($script:Target.ComputerName)" } else { '' }
     $warn = @()
@@ -7952,29 +8829,233 @@ function Start-AWClean {
     if (@($rules | Where-Object { $_.Id -eq 'MemDumps' }).Count) { $warn += 'WARNING: system memory dumps will be deleted. The Crashes tab can no longer analyze those past blue screens.' }
     $warnText = if ($warn.Count) { "`n`n" + ($warn -join "`n`n") } else { '' }
     if (-not (Confirm-AW "Computer Doctor will permanently delete the files matched by these rules$($where) (nothing goes to the Recycle Bin):`n`n$names$warnText`n`nFiles that are in use are skipped. Continue?")) { return }
+    # Then, if apps that hold back some of these rules are open: close them first, or clean the rest.
+    if (@($Blockers).Count) {
+        $ans = Show-AWCloseAppsDialog $Blockers
+        if ($ans -eq 'Cancel') { return }
+        if ($ans -eq 'Close') { $closeFirst = @($Blockers) }
+        else {
+            # Clean the rest: leave out the rules whose app is open (rules found by looking skip open apps themselves).
+            $held = @($Blockers | ForEach-Object { $_.RuleId } | Select-Object -Unique)
+            $rules = @($rules | Where-Object { $_.Kind -eq 'Found' -or $held -notcontains $_.Id })
+            if (-not $rules.Count) { return }
+        }
+    }
     Set-AWCleanerBusy $true
     $ui.CleanSummary.Text = 'Cleaning...'
-    $ui.CleanSubtext.Text = 'Removing files. Locked files are skipped automatically.'
+    $ui.CleanSubtext.Text = $(if ($closeFirst.Count) { 'Closing the open apps, then removing files. Locked files are skipped automatically.' } else { 'Removing files. Locked files are skipped automatically.' })
     $ui.CleanProgress.Value = 0
-    Start-AWTask -Name 'Clean' -Arguments @{ Rules = $rules } -Work {
+    Start-AWTask -Name 'Clean' -Arguments @{ Rules = $rules; Blockers = $closeFirst } -Work {
+        $still = @()
+        if (@($Blockers).Count) {
+            $Sync.Status = 'Closing apps...'
+            [void](Close-WBlockers $Blockers)
+            Write-WLog ('Asked ' + ((@($Blockers | ForEach-Object { $_.Label } | Select-Object -Unique)) -join ', ') + ' to close')
+            $still = @(Wait-WBlockersClosed $Blockers 15)
+            if ($still.Count) { Write-WLog "Still open, skipped: $($still -join ', ')" 'WARN' }
+        }
         $i = 0
         foreach ($rule in $Rules) {
             $Sync.Status = "Cleaning: $($rule.Name)"
             $Sync.Progress = [int]($i * 100 / $Rules.Count)
-            try { Invoke-WTarget { param($r) Invoke-WClean $r } -ArgumentList @(, $rule) }
+            $out = try { @(Invoke-WTarget { param($r) Invoke-WClean $r } -ArgumentList @(, $rule)) }
             catch {
                 Write-WLog "$($rule.Name): $($_.Exception.Message)" 'ERROR'
-                @{ Id = $rule.Id; Name = $rule.Name; Group = $rule.Group; Files = 0; Bytes = [long]0; Note = "Error: $($_.Exception.Message)" }
+                @(@{ Id = $rule.Id; Name = $rule.Name; Group = $rule.Group; Files = 0; Bytes = [long]0; Note = "Error: $($_.Exception.Message)" })
+            }
+            foreach ($x in $out) {
+                if ($still.Count -and $x -is [hashtable] -and $x.Skipped) {
+                    $names = @(if ($x.Sub) { if ($still -contains $x.Name) { $x.Name } } else { @($x.Blockers | ForEach-Object { $_.Label } | Where-Object { $still -contains $_ } | Select-Object -Unique) })
+                    if ($names.Count) { $x.Note = "$($names -join ', ') still open - skipped" }
+                }
+                $x
             }
             $i++
         }
         $Sync.Progress = 100
     } -OnComplete {
         param($Result)
-        Show-AWCleanResults $Result 'Clean'
+        Show-AWCleanResults $Result $script:CleanMode
         Set-AWCleanerBusy $false
     }
 }
+
+# ---- Automatic cleanup card (this PC, this account, rules that don't need admin)
+$script:AcDays = @('Daily', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')
+$script:AcLoading = $false
+
+function Update-AWAutoCleanSummary {
+    $ac = $script:State.AutoClean
+    $when = if ($ac.Day -eq 'Daily') { "every day at $($ac.Time)" } else { "every $($ac.Day) at $($ac.Time)" }
+    $last = 'Not run yet.'
+    if ($ac.LastRun) {
+        $t = try { ([datetime]::Parse([string]$ac.LastRun, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime().ToString('MMM d, HH:mm') } catch { [string]$ac.LastRun }
+        $last = "Last run $($t): $(if ($ac.LastResult) { $ac.LastResult } else { 'freed ' + (Format-AWSize ([long]$ac.LastFreed)) })."
+    }
+    $n = @(Get-AWAutoCleanRules).Count
+    $ui.AcSummary.Text = if ($ac.Enabled) { "On - $when, $n rule(s). $last" }
+                         else { 'Off - cleans the rules you choose on a schedule, for your account only (no administrator rights needed).' + $(if ($ac.LastRun) { " $last" } else { '' }) }
+}
+
+function Update-AWAutoCleanCard {
+    $remote = Test-AWRemote
+    $ac = $script:State.AutoClean
+    $ui.AcRemoteNote.Visibility = if ($remote) { 'Visible' } else { 'Collapsed' }
+    foreach ($c in 'AcOn', 'AcMore', 'AcRunNow') { $ui[$c].IsEnabled = -not $remote -and -not $script:CleanerBusy }
+    if ($remote) { $ui.AcDetails.Visibility = 'Collapsed' }
+    $script:AcLoading = $true
+    try {
+        $ui.AcOn.IsChecked = [bool]$ac.Enabled
+        $ui.AcDay.SelectedIndex = [Math]::Max(0, [array]::IndexOf($script:AcDays, [string]$ac.Day))
+        $ui.AcTime.Text = [string]$ac.Time
+        # Never set up: the rules that are on by default and don't need admin, without the Recycle Bin.
+        $sel = if (@($ac.Rules).Count -or $ac.Enabled) { @($ac.Rules) } else { Get-AWAutoCleanDefaultIds }
+        $ui.AcRules.Children.Clear()
+        foreach ($rule in @($script:CleanerRules | Where-Object { -not $_.Admin })) {
+            $cb = New-Object System.Windows.Controls.CheckBox
+            $cb.Content = $rule.Name; $cb.Tag = $rule.Id; $cb.ToolTip = $rule.Desc; $cb.Width = 230; $cb.Margin = '0,3'
+            $cb.IsChecked = $sel -contains $rule.Id
+            $cb.Add_Click({ Save-AWAutoCleanRules })
+            [void]$ui.AcRules.Children.Add($cb)
+        }
+    } finally { $script:AcLoading = $false }
+    Update-AWAutoCleanSummary
+}
+
+function Get-AWAutoCleanTicked { @($ui.AcRules.Children | Where-Object { $_.IsChecked } | ForEach-Object { [string]$_.Tag }) }
+function Save-AWAutoCleanRules {
+    $script:State.AutoClean.Rules = @(Get-AWAutoCleanTicked)
+    Save-AWState
+    Update-AWAutoCleanSummary
+}
+
+# The task runs a copy of this script from %LOCALAPPDATA%\ComputerDoctor\AutoClean, so it still works if the downloaded
+# copy moves. Signed-in user only, no admin, doesn't wake the PC, catches up after a missed start, stops after an hour.
+function Register-AWAutoCleanTask {
+    $ac = $script:State.AutoClean
+    $dir = Join-Path $script:DataDir 'AutoClean'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $copy = Join-Path $dir 'ComputerDoctor.ps1'
+    if ($PSCommandPath -and $PSCommandPath -ne $copy) { Copy-Item -LiteralPath $PSCommandPath -Destination $copy -Force -ErrorAction Stop }
+    $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $action = New-ScheduledTaskAction -Execute $exe -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$copy`" -AutoClean"
+    $at = [datetime]::ParseExact([string]$ac.Time, 'H:mm', $null)
+    $trigger = if ($ac.Day -eq 'Daily') { New-ScheduledTaskTrigger -Daily -At $at } else { New-ScheduledTaskTrigger -Weekly -DaysOfWeek $ac.Day -At $at }
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+    $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName $script:AutoCleanTask -TaskPath '\' -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
+        -Description 'Automatic cleanup set up in Computer Doctor (Cleaner > Automatic cleanup).' -Force -ErrorAction Stop | Out-Null
+}
+
+function Set-AWAutoCleanOn([bool]$On) {
+    if ($script:AcLoading) { return }
+    $ac = $script:State.AutoClean
+    if ($On) {
+        $ac.Rules = @(Get-AWAutoCleanTicked)
+        if (-not $ac.Rules.Count) { $ac.Rules = @(Get-AWAutoCleanDefaultIds) }
+        try {
+            Register-AWAutoCleanTask
+            $ac.Enabled = $true
+            Write-AWLog "Automatic cleanup on: $($ac.Day) at $($ac.Time), $(@(Get-AWAutoCleanRules).Count) rule(s)"
+            Write-AWAction 'AutoCleanSchedule' @("$($ac.Day) $($ac.Time)") @{ Rules = @($ac.Rules) } 'Done'
+        } catch {
+            $ac.Enabled = $false
+            Show-AWMessage "Could not schedule automatic cleanup:`n$($_.Exception.Message)" 'Error'
+        }
+    } else {
+        $ac.Enabled = $false
+        try {
+            if (Get-ScheduledTask -TaskName $script:AutoCleanTask -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $script:AutoCleanTask -Confirm:$false -ErrorAction Stop }
+            Write-AWLog 'Automatic cleanup off - scheduled task removed'
+            Write-AWAction 'AutoCleanSchedule' @('removed') @{} 'Done'
+        } catch { Write-AWLog "Could not remove the automatic cleanup task: $($_.Exception.Message)" 'WARN' }
+    }
+    Save-AWState
+    Update-AWAutoCleanCard
+}
+
+# Day or time changed: save, and move the task when it's on.
+function Save-AWAutoCleanSchedule {
+    if ($script:AcLoading) { return }
+    $ac = $script:State.AutoClean
+    $time = $ui.AcTime.Text.Trim()
+    if ($time -notmatch '^([01]?\d|2[0-3]):[0-5]\d$') { Show-AWMessage 'Enter the time as HH:mm, e.g. 12:00.'; $ui.AcTime.Text = $ac.Time; return }
+    $day = if ($ui.AcDay.SelectedItem) { [string]$ui.AcDay.SelectedItem.Content } else { 'Sunday' }
+    if ($day -eq $ac.Day -and $time -eq $ac.Time) { return }
+    $ac.Day = $day; $ac.Time = $time
+    if ($ac.Enabled) {
+        try { Register-AWAutoCleanTask; Write-AWLog "Automatic cleanup moved to $day at $time" }
+        catch { Show-AWMessage "Could not update the schedule:`n$($_.Exception.Message)" 'Error' }
+    }
+    Save-AWState
+    Update-AWAutoCleanSummary
+}
+
+function Start-AWAutoCleanNow {
+    $ids = @(Get-AWAutoCleanTicked)
+    $rules = @($script:CleanerRules | Where-Object { -not $_.Admin -and $ids -contains $_.Id })
+    if (-not $rules.Count) { Show-AWMessage 'Choose at least one rule for automatic cleanup (Settings).'; return }
+    $script:State.AutoClean.Rules = $ids; Save-AWState
+    Start-AWClean $rules 'Auto'
+}
+
+$ui.AcOn.Add_Checked({ Set-AWAutoCleanOn $true })
+$ui.AcOn.Add_Unchecked({ Set-AWAutoCleanOn $false })
+$ui.AcMore.Add_Click({ $ui.AcDetails.Visibility = if ($ui.AcDetails.Visibility -eq 'Visible') { 'Collapsed' } else { 'Visible' } })
+$ui.AcRunNow.Add_Click({ Start-AWAutoCleanNow })
+$ui.AcDay.Add_SelectionChanged({ Save-AWAutoCleanSchedule })
+$ui.AcTime.Add_LostFocus({ Save-AWAutoCleanSchedule })
+$ui.AcTime.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Return') { Save-AWAutoCleanSchedule } })
+
+# ---- Report for an administrator (when not running as admin): the admin cleanups, sized where readable, with steps.
+function Start-AWAdminReport {
+    if ($script:CleanerBusy) { return }
+    $rules = @($script:CleanerChecks | Where-Object { $_.Tag.Admin -and ($_.IsChecked -or $_.Tag.Default) } | ForEach-Object { $_.Tag })
+    if (-not $rules.Count) { Show-AWMessage 'No cleanups that need administrator rights are chosen.'; return }
+    Set-AWCleanerBusy $true
+    $ui.AdminReportInfo.Text = 'Building the report...'; $ui.AdminReportBar.Visibility = 'Visible'
+    Start-AWTask -Name 'Report for an administrator' -Arguments @{ Rules = $rules; ScriptPath = $PSCommandPath } -Work {
+        $items = foreach ($rule in $Rules) {
+            # Measured only where this account can read the folders; otherwise the admin measures it.
+            $roots = if ($rule.Kind -eq 'Found') { @($rule.Discover.Bases | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) }) } else { @($rule.Targets | ForEach-Object { Resolve-WTarget $_.Path }) }
+            $readable = $true
+            foreach ($r in $roots) {
+                try { $en = [IO.Directory]::EnumerateFileSystemEntries($r).GetEnumerator(); [void]$en.MoveNext() }
+                catch { if ($_.Exception -is [UnauthorizedAccessException] -or $_.Exception.InnerException -is [UnauthorizedAccessException]) { $readable = $false } }
+            }
+            $b = [long]-1
+            if ($readable) { try { $b = [long](@(Measure-WItem $rule) | Select-Object -First 1).Bytes } catch { $b = [long]-1 } }
+            @{ Id = $rule.Id; Name = $rule.Name; Desc = $rule.Desc; Bytes = $b }
+        }
+        $os = try { Get-CimInstance Win32_OperatingSystem -ErrorAction Stop } catch { $null }
+        $d = New-Object IO.DriveInfo $env:SystemDrive
+        $info = @{
+            Computer = $env:COMPUTERNAME; User = "$env:USERDOMAIN\$env:USERNAME"; Date = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+            Windows = $(if ($os) { "$($os.Caption) ($($os.Version))" } else { [Environment]::OSVersion.VersionString })
+            Drive = $(try { '{0} {1} free of {2}' -f $env:SystemDrive, (Format-WSize $d.AvailableFreeSpace), (Format-WSize $d.TotalSize) } catch { $env:SystemDrive })
+        }
+        New-WAdminReport $info @($items) $ScriptPath
+    } -OnComplete {
+        param($Result)
+        Set-AWCleanerBusy $false
+        $rep = @($Result | Where-Object { $_ -is [hashtable] -and $_.Html }) | Select-Object -Last 1
+        if (-not $rep) { $ui.AdminReportInfo.Text = 'The report could not be built - see the Activity log.'; return }
+        $file = Join-Path ([Environment]::GetFolderPath('MyDocuments')) ('Computer Doctor admin cleanup - {0} - {1:yyyy-MM-dd}.html' -f $env:COMPUTERNAME, (Get-Date))
+        try {
+            [IO.File]::WriteAllText($file, $rep.Html, (New-Object System.Text.UTF8Encoding $true))
+            $script:AdminReportText = $rep.Text
+            $ui.BtnAdminReportCopy.Visibility = 'Visible'
+            $ui.AdminReportInfo.Text = "Saved to $file"
+            $ui.AdminReportInfo.ToolTip = $file
+            Write-AWLog "Report for an administrator saved to $file"
+            Start-Process -FilePath $file
+        } catch { $ui.AdminReportInfo.Text = "Could not save the report: $($_.Exception.Message)" }
+    }
+}
+$ui.BtnAdminReport.Add_Click({ Start-AWAdminReport })
+$ui.BtnAdminReportCopy.Add_Click({
+    if ($script:AdminReportText) { [System.Windows.Clipboard]::SetText($script:AdminReportText); $ui.AdminReportInfo.Text = 'Copied as text - paste it into an email or chat.' }
+})
 
 $ui.BtnAnalyze.Add_Click({ Start-AWAnalyze })
 $ui.BtnClean.Add_Click({ Start-AWClean })
@@ -7999,6 +9080,66 @@ $script:MapPalette = @{
 }
 $script:MapEdge = New-Brush '#0B0D12'
 $script:MapSelEdge = New-Brush '#FFFFFF'
+
+# ---- "Highlight what you can clean": green = inside a target of a rule that doesn't need admin, or an old installer
+# in Downloads; red = a folder this account can't delete or read. This PC only.
+$script:MapGreenEdge = New-Brush '#4ADE80'; $script:MapRedEdge = New-Brush '#F87171'
+$script:MapGreenFill = New-Object System.Windows.Media.LinearGradientBrush(([System.Windows.Media.Color]::FromRgb(0x1F, 0x7A, 0x45)), ([System.Windows.Media.Color]::FromRgb(0x16, 0x65, 0x34)), 90); $script:MapGreenFill.Freeze()
+$script:MapRedFill = New-Object System.Windows.Media.LinearGradientBrush(([System.Windows.Media.Color]::FromRgb(0x99, 0x24, 0x24)), ([System.Windows.Media.Color]::FromRgb(0x7F, 0x1D, 0x1D)), 90); $script:MapRedFill.Freeze()
+$script:CleanMapState = ''        # '' = not loaded, 'Loading', 'Ready'
+$script:MapRightsPending = $false
+$script:MapInstallerExt = @('.exe', '.msi', '.msix', '.msixbundle', '.appx', '.iso')
+$script:MapDownloads = try {
+    $p = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction Stop).'{374DE290-123F-4565-9164-39C4925E467B}'
+    if ($p) { [Environment]::ExpandEnvironmentVariables($p).TrimEnd('\') } else { Join-Path $env:USERPROFILE 'Downloads' }
+} catch { Join-Path $env:USERPROFILE 'Downloads' }
+
+function Test-AWMapHighlight { [bool]$script:State.MapHighlight -and -not (Test-AWRemote) -and -not $script:ScanRemote }
+
+# The folders cleaner rules would empty, expanded on this PC (found in the background once per session).
+function Start-AWCleanMapLoad {
+    if ($script:CleanMapState) { return }
+    $script:CleanMapState = 'Loading'
+    Start-AWTask -Name 'Find what can be cleaned' -Arguments @{ Rules = @($script:CleanerRules | Where-Object { -not $_.Admin }) } -Work {
+        Get-WCleanMapEntries $Rules
+    } -OnComplete {
+        param($Result)
+        [ComputerDoctor.CleanMap]::Clear()
+        foreach ($e in @($Result | Where-Object { $_ -is [hashtable] -and $_.Path })) { [ComputerDoctor.CleanMap]::Add($e.Path, $e.Filter, [bool]$e.Recurse, $e.Reason) }
+        $script:CleanMapState = 'Ready'
+        if ($script:MapCurrent) { Request-AWMapRedraw }
+    }
+}
+
+# Why a tile is green or red: @{ Green; Text; Rule } or $null.
+function Get-AWMapMark($Node) {
+    if ($Node.IsGroup -or $Node.IsDir) {
+        $r = [ComputerDoctor.CleanMap]::Match($Node.FullPath, $true)
+        if ($r) { return @{ Green = $true; Text = "Junk you can clean: $r"; Rule = $true } }
+        if ($Node.IsGroup) { return $null }
+        $st = if ($Node.Denied) { 3 } else { [ComputerDoctor.FolderRights]::Get($Node.FullPath) }
+        if ($st -eq 0) { $script:MapRightsPending = $true; return $null }
+        if ($st -ge 2) { return @{ Green = $false; Text = "Your account can't delete this" + $(if ($script:IsAdmin) { ' - protected by Windows' } else { ' - run as administrator to clean here' }); Rule = $false } }
+        return $null
+    }
+    $r = [ComputerDoctor.CleanMap]::Match($Node.FullPath, $false)
+    if ($r) { return @{ Green = $true; Text = "Junk you can clean: $r"; Rule = $true } }
+    if ($script:MapDownloads -and $Node.FullPath.StartsWith($script:MapDownloads + '\', [StringComparison]::OrdinalIgnoreCase) -and
+        $script:MapInstallerExt -contains [IO.Path]::GetExtension($Node.Name).ToLowerInvariant() -and
+        $Node.Modified -ne [datetime]::MinValue -and $Node.Modified -lt (Get-Date).AddDays(-30)) {
+        return @{ Green = $true; Text = 'Old installer in Downloads'; Rule = $false }
+    }
+    $null
+}
+
+# Folder rights are checked in the background for the tiles drawn; redraw once they're known.
+$script:MapRightsTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:MapRightsTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$script:MapRightsTimer.Add_Tick({
+    if ([ComputerDoctor.FolderRights]::Pending -gt 0) { return }
+    $script:MapRightsTimer.Stop()
+    Show-AWTreeMap
+})
 
 function Get-AWMapBrush($Node, [int]$Depth) {
     $kind = if ($Node.IsGroup) { 'Group' } elseif ($Node.IsDir) { 'Dir' } else { 'File' }
@@ -8030,16 +9171,31 @@ $script:MenuZoom = Add-AWMenuItem $script:MapMenu 'Zoom in'           { if ($scr
 [void](Add-AWMenuItem $script:MapMenu 'Open in Explorer'              { if ($script:MapMenuNode) { Open-AWExplorer $script:MapMenuNode.FullPath } })
 [void](Add-AWMenuItem $script:MapMenu 'Copy path'                     { if ($script:MapMenuNode) { [System.Windows.Clipboard]::SetText($script:MapMenuNode.FullPath) } })
 $script:MenuRecycle = Add-AWMenuItem $script:MapMenu 'Send to Recycle Bin' { if ($script:MapMenuNode) { Remove-AWMapNodeToRecycle $script:MapMenuNode } }
+$script:MenuOpenCleaner = Add-AWMenuItem $script:MapMenu 'Open Cleaner' { Select-AWView 'Cleaner' }
 
 function Select-AWMapNode($Node, $Border) {
-    if ($script:MapSelectedBorder) { $script:MapSelectedBorder.BorderBrush = $script:MapEdge; $script:MapSelectedBorder.BorderThickness = 1 }
+    if ($script:MapSelectedBorder) {
+        $m = $script:MapSelectedBorder.DataContext
+        if ($m -and $m.Edge) { $script:MapSelectedBorder.BorderBrush = $m.Edge; $script:MapSelectedBorder.BorderThickness = 2 }
+        else { $script:MapSelectedBorder.BorderBrush = $script:MapEdge; $script:MapSelectedBorder.BorderThickness = 1 }
+    }
     $script:MapSelected = $Node
     $script:MapSelectedBorder = $Border
     if ($Border) { $Border.BorderBrush = $script:MapSelEdge; $Border.BorderThickness = 2 }
+    $ui.MapSelReason.Visibility = 'Collapsed'; $ui.MapOpenCleaner.Visibility = 'Collapsed'
     if (-not $Node) {
         $ui.MapSelName.Text = 'Nothing selected'; $ui.MapSelPath.Text = ''; $ui.MapSelSize.Text = ''; $ui.MapSelMeta.Text = ''
         $ui.MapOpen.IsEnabled = $false; $ui.MapZoom.IsEnabled = $false; $ui.MapRecycle.IsEnabled = $false
         return
+    }
+    if (Test-AWMapHighlight) {
+        $mark = Get-AWMapMark $Node
+        if ($mark) {
+            $ui.MapSelReason.Text = $mark.Text
+            $ui.MapSelReason.Foreground = if ($mark.Green) { $script:MapGreenEdge } else { $script:MapRedEdge }
+            $ui.MapSelReason.Visibility = 'Visible'
+            if ($mark.Rule) { $ui.MapOpenCleaner.Visibility = 'Visible' }
+        }
     }
     $ui.MapSelName.Text = $Node.Name
     $ui.MapSelPath.Text = $Node.FullPath
@@ -8060,6 +9216,7 @@ function Set-AWMapCurrent($Node) {
 
 function Add-AWTreeMapLevel($Node, [double]$X, [double]$Y, [double]$W, [double]$H, [int]$Depth) {
     $rects = [ComputerDoctor.Treemap]::Layout($Node.Children, $X, $Y, $W, $H)
+    $hl = Test-AWMapHighlight
     foreach ($r in $rects) {
         if ($script:MapElementCount -gt 4000) { return }
         if ($r.W -lt 3 -or $r.H -lt 3) { continue }
@@ -8074,6 +9231,16 @@ function Add-AWTreeMapLevel($Node, [double]$X, [double]$Y, [double]$W, [double]$
         $b.Tag = $n
         $b.Cursor = 'Hand'
         $b.ToolTip = "{0}`n{1}  ({2:0.0}%)`n{3}" -f $n.Name, $n.SizeText, $n.PercentOfParent, $n.FullPath
+        if ($hl) {
+            $mark = Get-AWMapMark $n
+            if ($mark) {
+                $edge = if ($mark.Green) { $script:MapGreenEdge } else { $script:MapRedEdge }
+                $b.Background = if ($mark.Green) { $script:MapGreenFill } else { $script:MapRedFill }
+                $b.BorderBrush = $edge; $b.BorderThickness = 2
+                $b.DataContext = [pscustomobject]@{ Edge = $edge }
+                $b.ToolTip = "$($b.ToolTip)`n`n$($mark.Text)" + $(if ($mark.Rule) { ' (Open Cleaner from the Selected panel or the right-click menu)' } else { '' })
+            }
+        }
         $b.ContextMenu = $script:MapMenu
 
         $canNest = $n.IsDir -and $Depth -lt $script:MapMaxDepth -and $r.W -gt 64 -and $r.H -gt 44 -and $n.Children.Count -gt 0
@@ -8101,6 +9268,8 @@ function Add-AWTreeMapLevel($Node, [double]$X, [double]$Y, [double]$W, [double]$
             param($s, $e)
             $script:MapMenuNode = $s.Tag
             $script:MenuZoom.IsEnabled = $s.Tag.IsDir -and $s.Tag.Children.Count -gt 0
+            $mk = if (Test-AWMapHighlight) { Get-AWMapMark $s.Tag } else { $null }
+            $script:MenuOpenCleaner.Visibility = if ($mk -and $mk.Rule) { 'Visible' } else { 'Collapsed' }
             $script:MenuRecycle.IsEnabled = -not $s.Tag.IsGroup -and $s.Tag.Parent
             Select-AWMapNode $s.Tag $s
         })
@@ -8123,7 +9292,11 @@ function Show-AWTreeMap {
     $w = $ui.MapCanvas.ActualWidth; $h = $ui.MapCanvas.ActualHeight
     if ($w -lt 20 -or $h -lt 20) { return }
     $script:MapElementCount = 0
+    $script:MapRightsPending = $false
+    if (Test-AWMapHighlight) { Start-AWCleanMapLoad }
     Add-AWTreeMapLevel $node 0 0 $w $h 0
+    if ($script:MapRightsPending) { $script:MapRightsTimer.Start() }
+    if ($script:MapSelected) { Select-AWMapNode $script:MapSelected $null }
 }
 
 # Debounced redraw on resize
@@ -8190,6 +9363,7 @@ function Update-AWMapScope {
         $ui.MapScopeText.Text = if ($ui.MapOnRemote.IsChecked) { "Scanning $($script:Target.ComputerName). Drives are read through its \\$($script:Target.ComputerName)\C`$ share, or on that PC over WinRM if the share isn't reachable. Removing files there is permanent (no Recycle Bin over the network)." }
                                 else { "Scanning THIS PC ($env:COMPUTERNAME), not $($script:Target.ComputerName)." }
     }
+    Update-AWMapHighlightUI
     $ui.MapBrowse.IsEnabled = -not (Test-AWMapRemote)
     $ui.MapBrowse.ToolTip = if (Test-AWMapRemote) { 'Type a folder on the remote PC, e.g. C:\Users' } else { 'Browse for a folder' }
     Initialize-AWMapDrives
@@ -8216,6 +9390,8 @@ function Start-AWMapScan([string]$Path) {
     } catch { }
 
     $script:Scanner = New-Object ComputerDoctor.DiskScanner
+    [ComputerDoctor.FolderRights]::Clear()
+    $ui.MapDenied.Visibility = 'Collapsed'
     $Sync.Scanning = $true
     $ui.MapScan.IsEnabled = $false; $ui.MapStop.IsEnabled = $true; $ui.LargeScan.IsEnabled = $false
     $ui.MapCanvas.Children.Clear(); $ui.MapHint.Visibility = 'Collapsed'
@@ -8233,6 +9409,13 @@ function Complete-AWMapScan {
     $ui.MapScan.IsEnabled = $true; $ui.MapStop.IsEnabled = $false; $ui.LargeScan.IsEnabled = $true
     if (-not $s -or -not $s.Root) { $ui.MapCrumb.Text = 'Scan failed - see the Activity log'; return }
     $script:MapRoot = $s.Root
+    # Folders the scan couldn't read (counted for scans of this PC).
+    $ui.MapDenied.Visibility = 'Collapsed'
+    if (-not $script:ScanRemote -and $s.DeniedFolders -gt 0) {
+        $ui.MapDenied.Text = "{0:N0} folders couldn't be read ({1})" -f $s.DeniedFolders, $(if ($script:IsAdmin) { 'protected by Windows' } else { 'needs admin' })
+        $ui.MapDenied.Visibility = 'Visible'
+    }
+    Update-AWMapHighlightUI
     Set-AWMapCurrent $s.Root
     $ui.MapExtList.ItemsSource = @($s.ExtensionList | Select-Object -First 12)
     $ui.MapKindList.ItemsSource = @(Get-AWKindStats $s.ExtensionList)
@@ -8379,6 +9562,22 @@ function Remove-AWMapNodeToRecycle($Node) {
         Show-AWMessage "Could not recycle:`n$($_.Exception.Message)" 'Error'
     }
 }
+
+function Update-AWMapHighlightUI {
+    $remote = Test-AWRemote
+    $ui.MapHighlight.IsEnabled = -not $remote
+    $ui.MapHlNote.Visibility = if ($remote) { 'Visible' } else { 'Collapsed' }
+    $ui.MapHlLegend.Visibility = if (Test-AWMapHighlight) { 'Visible' } else { 'Collapsed' }
+}
+$ui.MapHighlight.IsChecked = [bool]$script:State.MapHighlight
+Update-AWMapHighlightUI
+$ui.MapHighlight.Add_Click({
+    $script:State.MapHighlight = [bool]$ui.MapHighlight.IsChecked
+    Save-AWState
+    Update-AWMapHighlightUI
+    if ($script:MapCurrent) { Show-AWTreeMap }
+})
+$ui.MapOpenCleaner.Add_Click({ Select-AWView 'Cleaner' })
 
 $ui.MapScan.Add_Click({ Start-AWMapScan $ui.MapPath.Text })
 $ui.MapPath.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Return') { Start-AWMapScan $ui.MapPath.Text } })
@@ -8870,6 +10069,9 @@ $script:Programs = @()
 function Update-AWProgramView {
     $q = $ui.ProgSearch.Text.Trim()
     $items = @(if ($q) { $script:Programs | Where-Object { $_.Name -like "*$q*" -or $_.Publisher -like "*$q*" } } else { $script:Programs })
+    # Installed for: "Just me" = this account's Uninstall key (HKCU), "All users" = HKLM (64- and 32-bit).
+    $scope = $script:State.ProgramsScope
+    if ($scope -ne 'All') { $items = @($items | Where-Object { $_.For -eq $scope }) }
     $ui.ProgList.ItemsSource = $items
     [long]$sum = 0; foreach ($p in $items) { $sum += $p.SizeBytes }
     $ui.ProgInfo.Text = '{0:N0} programs - {1} reported size' -f $items.Count, (Format-AWSize $sum)
@@ -8882,6 +10084,7 @@ function Update-AWProgramList {
     $ui.ProgUninstall.IsEnabled = -not $remote
     $ui.ProgOpen.IsEnabled = -not $remote
     $ui.ProgUninstall.ToolTip = if ($remote) { 'Uninstalling is only available on this PC.' } else { $null }
+    $ui.ProgNote.Visibility = if (-not $remote -and -not $script:IsAdmin) { 'Visible' } else { 'Collapsed' }
     Start-AWTask -Name 'Read installed programs' -Work {
         $raw = Invoke-WTarget {
             $paths = @(
@@ -8914,7 +10117,7 @@ function Update-AWProgramList {
             [pscustomobject]@{
                 Name = $r.Name; Publisher = $r.Publisher; Version = $r.Version; Installed = $r.Installed
                 SizeBytes = [long]$r.SizeBytes; SizeText = $(if ($r.SizeBytes) { [ComputerDoctor.Fmt]::Size([long]$r.SizeBytes) } else { '' })
-                Scope = $r.Scope; Uninstall = $r.Uninstall; Location = $r.Location
+                Scope = $r.Scope; For = $(if ($r.Scope -eq 'User') { 'Just me' } else { 'All users' }); Uninstall = $r.Uninstall; Location = $r.Location
             }
         }
     } -OnComplete {
@@ -8926,6 +10129,15 @@ function Update-AWProgramList {
 }
 
 $ui.ProgSearch.Add_TextChanged({ Update-AWProgramView })
+switch ($script:State.ProgramsScope) { 'Just me' { $ui.ProgForMe.IsChecked = $true } 'All users' { $ui.ProgForUsers.IsChecked = $true } default { $ui.ProgForAll.IsChecked = $true } }
+foreach ($rb in @($ui.ProgForAll, $ui.ProgForMe, $ui.ProgForUsers)) {
+    $rb.Add_Checked({
+        param($s, $e)
+        $script:State.ProgramsScope = [string]$s.Content
+        Save-AWState
+        Update-AWProgramView
+    })
+}
 $ui.ProgRefresh.Add_Click({ Update-AWProgramList })
 $ui.ProgOpen.Add_Click({
     $p = $ui.ProgList.SelectedItem
@@ -8936,7 +10148,8 @@ $ui.ProgOpen.Add_Click({
 $ui.ProgUninstall.Add_Click({
     $p = $ui.ProgList.SelectedItem
     if (-not $p) { Show-AWMessage 'Select a program first.'; return }
-    if (-not (Confirm-AW "Start the uninstaller for:`n`n$($p.Name) $($p.Version)`n`nThe program's own uninstaller will open.")) { return }
+    $adminNote = if ($p.For -eq 'All users' -and -not $script:IsAdmin) { "`n`n$($p.Name) is installed for all users, so Windows will ask for administrator rights to uninstall it." } else { '' }
+    if (-not (Confirm-AW "Start the uninstaller for:`n`n$($p.Name) $($p.Version)`n`nThe program's own uninstaller will open.$adminNote")) { return }
     try {
         $cmd = $p.Uninstall
         if ($cmd -match 'msiexec' -and $cmd -match '\{[0-9A-Fa-f\-]{36}\}') {
