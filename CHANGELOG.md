@@ -5,6 +5,8 @@ them as the GitHub release notes, which SauceStore shows as the app's version hi
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-11-21
+
 - Added cleaner rules that need no admin rights: Internet cache, Store app caches, browser service worker caches, Visual Studio Code, Slack, Spotify, OneDrive logs, and npm, pip, NuGet and Yarn caches
 - Added "Other apps' logs and temp files" (on by default, files older than 7 days) and "Other apps' caches", found by looking in your profile and shown per app in Analyze
 - Added "Program logs (all users)": old ProgramData logs (admin, on by default); "Setup and CBS logs" is now "Windows logs" (older than 30 days, on by default)

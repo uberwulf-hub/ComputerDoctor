@@ -139,7 +139,7 @@
 
 .NOTES
     Name    : ComputerDoctor.ps1
-    Version : 1.11.1
+    Version : 1.12.0
     Author  : Andrew Saulls
     Requires: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7+ (Windows)
     Log     : %LOCALAPPDATA%\ComputerDoctor\ComputerDoctor.log
@@ -179,7 +179,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:AppVersion = '1.11.1'
+$script:AppVersion = '1.12.0'
 $script:CliMode = [bool]($Config -or $Analyze -or $Clean -or $HealthCheck -or $ApplyTweak -or $RevertTweak -or $RemoveApp -or
                          $RestorePoint -or $ListRules -or $ListTweaks -or $ListApps -or $CheckDrivers -or $Backup -or $AutoClean -or $Inventory -or $ExportNeeds -or $Fetch)
 
