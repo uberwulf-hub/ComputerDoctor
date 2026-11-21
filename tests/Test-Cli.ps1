@@ -16,6 +16,8 @@ function Check([string]$Name, [bool]$Ok, [string]$Detail = '') {
 }
 
 $r = Invoke-AW @('-ListRules');  Check 'ListRules shows rule IDs' ($r.Code -eq 0 -and $r.Out -match 'UserTemp') "exit $($r.Code)"
+$missing = @('INetCache', 'StoreAppCaches', 'ProgramLogs', 'BrowserSW', 'VSCode', 'Slack', 'Spotify', 'OneDriveLogs', 'AppLogs', 'AppCaches', 'NpmCache', 'PipCache', 'NuGetCache', 'YarnCache') | Where-Object { $r.Out -notmatch "\b$_\b" }
+Check 'ListRules shows the newer rules' (@($missing).Count -eq 0) "missing: $(@($missing) -join ', ')"
 $r = Invoke-AW @('-ListTweaks'); Check 'ListTweaks shows tweak IDs' ($r.Code -eq 0 -and $r.Out -match 'FileExt') "exit $($r.Code)"
 $r = Invoke-AW @('-Clean', 'NoSuchRule'); Check 'Unknown rule is rejected with exit 2' ($r.Code -eq 2)
 $r = Invoke-AW @('-ApplyTweak', 'NoSuchTweak'); Check 'Unknown tweak is rejected with exit 2' ($r.Code -eq 2)

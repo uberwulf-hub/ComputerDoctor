@@ -6,7 +6,7 @@
 
 .DESCRIPTION
     1. Refuses unless the repository is on main, everything is committed and CHANGELOG.md's "Unreleased" has lines.
-    2. Runs the checks that need no admin rights and no internet (tests\Test-Cli, Test-Backup, Test-OldFiles): all
+    2. Runs the checks that need no admin rights and no internet (tests\Test-Cli, Test-Backup, Test-OldFiles, Test-Cleaner): all
        must pass.
     3. Writes the version into ComputerDoctor.ps1 ($script:AppVersion and the help's Version line), moves
        "Unreleased" in CHANGELOG.md to "## [X.Y.Z] - date", commits "Computer Doctor X.Y.Z" and tags vX.Y.Z with
@@ -65,7 +65,7 @@ if (-not $WhatIf) {
 # ---- 2. the checks
 if (-not $SkipTests) {
     $exe = (Get-Process -Id $PID).Path
-    foreach ($t in 'Test-Cli.ps1', 'Test-Backup.ps1', 'Test-OldFiles.ps1') {
+    foreach ($t in 'Test-Cli.ps1', 'Test-Backup.ps1', 'Test-OldFiles.ps1', 'Test-Cleaner.ps1') {
         Step "Running $t"
         $ErrorActionPreference = 'Continue'
         $out = & $exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo "tests\$t") 2>&1 | ForEach-Object { "$_" }

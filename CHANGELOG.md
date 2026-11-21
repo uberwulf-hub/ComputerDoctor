@@ -5,6 +5,15 @@ them as the GitHub release notes, which SauceStore shows as the app's version hi
 
 ## [Unreleased]
 
+- Added cleaner rules that need no admin rights: Internet cache, Store app caches, browser service worker caches, Visual Studio Code, Slack, Spotify, OneDrive logs, and npm, pip, NuGet and Yarn caches
+- Added "Other apps' logs and temp files" (on by default, files older than 7 days) and "Other apps' caches", found by looking in your profile and shown per app in Analyze
+- Added "Program logs (all users)": old ProgramData logs (admin, on by default); "Setup and CBS logs" is now "Windows logs" (older than 30 days, on by default)
+- Added Automatic cleanup in the Cleaner: the rules you choose run on a schedule for your account, without admin rights (also -AutoClean)
+- Added a prompt to close apps that hold back a cleanup (they close normally, never forced); automatic cleanup asks in a small popup
+- Added "Report for an administrator" in the Cleaner: a page with the cleanups that need admin rights and short steps, also copied as text
+- Added "Highlight what you can clean" on the Space Map: green for junk you can clean, red for folders your account can't delete
+- Added an "installed for" filter to Programs (All, Just me, All users)
+
 ## [1.11.1] - 2026-11-18
 
 - Fixed backups not keeping an older version of folders deleted since the last backup
